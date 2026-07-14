@@ -40,6 +40,9 @@ def write_json_warpper(data, path):
 
 
 class DataAccessor:
+    """
+    Load processed tensor files.
+    """
     def __init__(self, read_only: bool = True):
         self.read_only = read_only
         self.brain_read_func_dict = {

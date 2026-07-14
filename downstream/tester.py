@@ -1,3 +1,7 @@
+"""
+The main evaluation loop.
+"""
+
 import os
 import json
 import torch

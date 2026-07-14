@@ -3,7 +3,6 @@ import json
 import random
 from typing import List
 import sys
-import argparse
 project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 if project_dir not in sys.path:
     sys.path.insert(0, project_dir)

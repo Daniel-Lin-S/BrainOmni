@@ -1,4 +1,5 @@
 import torch
+from typing import Tuple
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -13,6 +14,30 @@ from model_utils.module import (
 
 
 class BrainTokenizer(nn.Module):
+    """
+    BrainTokenizer model for compressing multi-channel brain signals into discrete tokens.
+
+    This model uses a VQ-VAE architecture with a SEANet-based encoder and decoder,
+    supplemented by a sensor embedding module to handle varied sensor types and positions.
+
+    Attributes
+    ----------
+    window_length : int
+        The temporal length of each signal window.
+    n_dim : int
+        The dimension of the latent feature space.
+    sensor_embed : BrainSensorModule
+        Module for encoding sensor positions and types.
+    mask_ratio : float
+        Ratio of channels to mask during training to improve robustness.
+    encoder : BrainTokenizerEncoder
+        Spatial-temporal encoder for brain signals.
+    quantizer : BrainQuantizer
+        Vector quantization module for discretizing features.
+    decoder : BrainTokenizerDecoder
+        Spatial-temporal decoder for signal reconstruction.
+    """
+
     def __init__(
         self,
         window_length,
@@ -31,6 +56,18 @@ class BrainTokenizer(nn.Module):
         quantize_optimize_method: str,
         **kwargs,
     ):
+        """
+        Parameters
+        ----------
+        codebook_dim : int
+            Dimension of the codebook vectors, if different to n_dim,
+            latent features will be projected linearly into codewords,
+            and projected linearly out before decoding.
+        codebook_size : int
+            Number of codewords in the codebook.
+        num_quantizers : int
+            Number of quantizers to use in the model.
+        """
         super().__init__()
         self.window_length = window_length
         self.n_dim = n_dim
@@ -131,9 +168,33 @@ class BrainTokenizer(nn.Module):
         self, x: torch.Tensor, pos: torch.Tensor, sensor_type: torch.Tensor, **kwargs
     ):
         """
-        x: B C (N L)
-        pos: B C 6
-        sensor_type: B C
+        Forward pass for training the VQ-VAE.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input brain signal of shape (Batch, Channels, Time).
+        pos : torch.Tensor
+            Sensor coordinates and orientations of shape (Batch, Channels, 6).
+        sensor_type : torch.Tensor
+            Sensor category indices of shape (Batch, Channels).
+        **kwargs
+            Additional arguments.
+
+        Returns
+        -------
+        Dict[str, torch.Tensor]
+            TThe optimisation metrics:
+            - loss: Total weighted loss for backpropagation.
+            - time_loss: Temporal reconstruction MSE.
+            - pcc: Waveform correlation coefficient.
+            - amp_loss: Frequency domain amplitude match.
+            - phase_loss: Frequency domain phase match.
+            - commitment_loss: RVQ codebook stability loss.
+            - judge_loss: Detached total loss for performance monitoring.
+        torch.Tensor
+            Discrete codebook indices of shape (Batch, Channels, Window, num_quantizers).
+            num_quantizers - number of quantizers used in the model.
         """
         x = self.unfold(x)
 
@@ -182,9 +243,24 @@ class BrainTokenizer(nn.Module):
         self, x: torch.Tensor, pos: torch.Tensor, sensor_type: torch.Tensor, **kwargs
     ):
         """
-        x: B C (W T)
-        pos: B C 6
-        sensor_type: B C
+        A function that reconstructs input signal for visualisation purpose.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input brain signal of shape (Batch, Channels, Time).
+        pos : torch.Tensor
+            Sensor coordinates and orientations of shape (Batch, Channels, 6).
+        sensor_type : torch.Tensor
+            Sensor category indices of shape (Batch, Channels).
+        
+        Return
+        ------
+        Dict[str, torch.Tensor]
+            key-value pairs:
+            - x : torch.Tensor, the normalised input signal of shape (Batch, Channels, Time).
+            - x_rec : torch.Tensor, the reconstructed signal of the same shape as x.
+            - sensor_type : torch.Tensor, the sensor category indices of shape (Batch, Channels).
         """
         x = self.unfold(x)
         sensor_embedding = self.sensor_embed(pos, sensor_type)
@@ -205,11 +281,29 @@ class BrainTokenizer(nn.Module):
         sensor_type: torch.Tensor,
         overlap_ratio: float,
         **kwargs,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        x: B C T
-        pos: B C 6
-        sensor_type: B C
+        Convert brain signals into discrete latent tokens.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input brain signal of shape (Batch, Channels, Time).
+        pos : torch.Tensor
+            Sensor coordinates and orientations of shape (Batch, Channels, 6).
+        sensor_type : torch.Tensor
+            Sensor category indices of shape (Batch, Channels).
+        overlap_ratio : float
+            Overlap ratio between consecutive temporal windows.
+        **kwargs
+            Additional arguments.
+
+        Returns
+        -------
+        features : torch.Tensor
+            Continuous latent representations of shape (Batch, Channels, Window, n_dim).
+        indices : torch.Tensor
+            Discrete codebook indices of shape (Batch, Channels, Window, num_quantizers).
         """
         self.eval()
         x = self.unfold(x, overlap_ratio=overlap_ratio)
