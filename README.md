@@ -73,6 +73,10 @@ See `demo.ipynb` for how to use BrainOmni.
 
 ## 🚢 Pretraining
 
+For the complete configuration schema, defaults, local overrides, and
+checkpoint-export workflow, see
+[Pre-training configuration](docs/pretraining_configuration.md).
+
 ### Data preprocessing
 To preprocess pretraining datasets, run 
 ```bash

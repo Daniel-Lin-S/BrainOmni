@@ -141,14 +141,20 @@ def auto_detect_bad_channels(raw: mne.io.Raw, eeg_mask, mag_mask, grad_mask):
     return bad_channels
 
 
-def filter_resample_preprocess(raw, dataset: str):
+def filter_resample_preprocess(
+    raw,
+    dataset: str,
+    sample_rate_hz: float,
+    low_frequency_hz: float,
+    high_frequency_hz: float,
+):
     notch_freqs = [50, 60]
     if len(notch_freqs) > 0:
         raw = raw.notch_filter(freqs=notch_freqs, verbose=False)
     if dataset in HPI_LIST:
         raw = mne.chpi.filter_chpi(raw, include_line=False, verbose=False)
-    raw = raw.resample(SAMPLE_RATE, verbose=False, n_jobs=2)
-    raw = raw.filter(LOW, HIGH, verbose=False)
+    raw = raw.resample(sample_rate_hz, verbose=False, n_jobs=2)
+    raw = raw.filter(low_frequency_hz, high_frequency_hz, verbose=False)
     return raw
 
 
@@ -210,13 +216,14 @@ def split_to_segments_save(
     path: str,
     dataset: str,
     ready_path: str,
+    sample_rate_hz: float,
     TIME: int,
     STRIDE: int,
 ):
     segments_metadata = []
     start = 0
-    end = int(start + TIME * SAMPLE_RATE)
-    stride_length = int(STRIDE * SAMPLE_RATE)
+    end = int(start + TIME * sample_rate_hz)
+    stride_length = int(STRIDE * sample_rate_hz)
     dataset_name = accessor.get_dataset_folder_name(path)
     dataset_to_file_path = f"{dataset_name}/" + path.split(f"/{dataset_name}/")[-1]
     brain_file_folder_path = os.path.join(ready_path, dataset_to_file_path).rsplit(
@@ -257,22 +264,27 @@ def split_to_segments_save(
     return segments_metadata
 
 
-def split_pretrain_metadata(data):
+def split_pretrain_metadata(data, split_ratios: dict[str, float]):
     new_device_dataset_dict = {}
     for dataset in NEW_DEVICE_DATASET_LIST:
         new_device_dataset_dict[dataset] = [i for i in data if i["dataset"] == dataset]
     data = [i for i in data if i["dataset"] not in NEW_DEVICE_DATASET_LIST]
     random.shuffle(data)
     N = len(data)
-    train = data[: int(N * 0.85)]
-    val = data[int(N * 0.85) : int(N * 0.95)]
-    test = data[int(N * 0.95) :]
+    train_end = int(N * split_ratios["train"])
+    validation_end = train_end + int(N * split_ratios["validation"])
+    train = data[:train_end]
+    val = data[train_end:validation_end]
+    test = data[validation_end:]
     return train, val, test, new_device_dataset_dict
 
 
 def process(
     accessor: DataAccessor,
     path: str,
+    sample_rate_hz: float,
+    low_frequency_hz: float,
+    high_frequency_hz: float,
     dataset: str,
     ready_path: str,
     TIME: int,
@@ -287,7 +299,13 @@ def process(
     eeg_mask, mag_mask, grad_mask, meg_mask = get_sensor_type_mask(sensor_type)
     pos = normalize_pos(pos, eeg_mask, meg_mask)
 
-    raw = filter_resample_preprocess(raw, dataset)
+    raw = filter_resample_preprocess(
+        raw,
+        dataset,
+        sample_rate_hz,
+        low_frequency_hz,
+        high_frequency_hz,
+    )
 
     bad_channels = auto_detect_bad_channels(raw, eeg_mask, mag_mask, grad_mask)
     if len(bad_channels) > 0:
@@ -313,5 +331,6 @@ def process(
         ready_path,
         TIME,
         STRIDE,
+        sample_rate_hz,
     )
     return segments_metadata, path

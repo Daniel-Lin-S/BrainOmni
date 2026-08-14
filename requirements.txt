@@ -27,6 +27,7 @@ nvidia-nccl-cu12==2.21.5
 nvidia-nvjitlink-cu12==12.4.127
 nvidia-nvtx-cu12==12.4.127
 pandas==2.2.3
+PyYAML==6.0.2
 scikit-learn==1.6.1
 scipy==1.15.1
 tensorboard==2.19.0

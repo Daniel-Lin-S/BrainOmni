@@ -11,7 +11,7 @@ from factory.utils import (
 )
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from accessor import DataAccessor
-from constant import SEED, LOW, HIGH, SAMPLE_RATE, RAW_PATH, PRETRAIN_METADATA_PATH,PROCESSED_PRETRAIN_PATH
+from pretrain_config import load_pretrain_config, metadata_directory
 
 def seed_everything(seed):
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -42,32 +42,35 @@ def get_logger():
 
 def parse_arg():
     parser = argparse.ArgumentParser("")
-    parser.add_argument("--time", type=int, help="the length of each segment")
-    parser.add_argument("--stride", type=int, help="stride when segmenting")
-    parser.add_argument("--max_workers", type=int, default=32)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--local-config", type=str)
+    parser.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args()
     return args
 
 
 if __name__ == "__main__":
     args = parse_arg()
-    TIME = args.time
-    STRIDE = args.stride
-    max_workers = args.max_workers
+    config = load_pretrain_config(
+        args.config, args.local_config, args.overrides
+    )
+    preprocessing = config["campaign"]["data"]["preprocessing"]
+    invocation = config["invocation"]
+    TIME = preprocessing["segment_seconds"]
+    STRIDE = preprocessing["stride_seconds"]
+    max_workers = invocation["preprocess_workers"]
+    selected_datasets = config["campaign"]["data"]["included_datasets"]
     logger = get_logger()
     logger.info("initializing accessor...")
     accessor = DataAccessor(read_only=False)
 
     # pretrain data part
     processed_pretrain_path = os.path.join(
-        PROCESSED_PRETRAIN_PATH,
-        f"sfreq_{SAMPLE_RATE}_low_{LOW}_high_{HIGH}_time_{TIME}_stride_{STRIDE}",
+        invocation["processed_root"],
+        metadata_directory(config).name,
     )
 
-    pretrain_metadata_path = os.path.join(
-        PRETRAIN_METADATA_PATH,
-        f"sfreq_{SAMPLE_RATE}_low_{LOW}_high_{HIGH}_time_{TIME}_stride_{STRIDE}",
-    )
+    pretrain_metadata_path = str(metadata_directory(config))
 
     os.makedirs(
         pretrain_metadata_path,
@@ -78,7 +81,7 @@ if __name__ == "__main__":
     info_path = os.path.join(pretrain_metadata_path, "info.json")
 
     logger.info("searching_brain_files...")
-    brain_files = accessor.search_brain_files(root_path=RAW_PATH)
+    brain_files = accessor.search_brain_files(root_path=invocation["raw_root"])
     logger.info("loading archives...")
     if os.path.exists(finish_path):
         with open(finish_path, "r") as f:
@@ -94,6 +97,10 @@ if __name__ == "__main__":
 
     logger.info("filtering brain files...")
     brain_files = [i for i in brain_files if i["path"] not in finish]
+    if selected_datasets != ["*"]:
+        brain_files = [
+            item for item in brain_files if item["dataset"] in selected_datasets
+        ]
 
     logger.info("start processing...")
     counter = 0
@@ -105,6 +112,9 @@ if __name__ == "__main__":
                     process,
                     accessor,
                     i["path"],
+                    preprocessing["sample_rate_hz"],
+                    preprocessing["low_frequency_hz"],
+                    preprocessing["high_frequency_hz"],
                     i["dataset"],
                     processed_pretrain_path,
                     TIME,
@@ -133,8 +143,11 @@ if __name__ == "__main__":
     with open(info_path, "w") as f:
         json.dump(metadata_list, f)
 
-    seed_everything(seed=SEED)
-    train, val, test, new_device_dataset_dict = split_pretrain_metadata(metadata_list)
+    seed_everything(seed=config["campaign"]["seed"])
+    train, val, test, new_device_dataset_dict = split_pretrain_metadata(
+        metadata_list,
+        config["campaign"]["data"]["split_ratios"],
+    )
     with open(os.path.join(pretrain_metadata_path, "train.json"), "w") as f:
         json.dump(train, f, indent=4)
     with open(os.path.join(pretrain_metadata_path, "val.json"), "w") as f:

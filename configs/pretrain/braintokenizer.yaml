@@ -1,0 +1,78 @@
+schema_version: 1
+campaign:
+  stage: braintokenizer
+  seed: 42
+  data:
+    signal_type: both
+    included_datasets: ["*"]
+    split_ratios:
+      train: 0.85
+      validation: 0.10
+      test: 0.05
+    preprocessing:
+      sample_rate_hz: 256
+      low_frequency_hz: 0.1
+      high_frequency_hz: 96
+      segment_seconds: 10
+      stride_seconds: 10
+  model:
+    window_length: 512
+    n_filters: 32
+    ratios: [8, 4, 2]
+    kernel_size: 5
+    last_kernel_size: 5
+    n_dim: 256
+    n_neuro: 16
+    n_head: 4
+    dropout: 0.0
+    codebook_dim: 256
+    codebook_size: 512
+    num_quantizers: 4
+    rotation_trick: true
+    quantize_optimize_method: ema
+  objective:
+    channel_mask_ratio: 0.25
+    noise_std: 0.1
+  optimizer:
+    type: AdamW
+    lr: 0.0002
+    codebook_lr: 0.0003
+    betas: [0.5, 0.9]
+    eps: 0.00001
+    weight_decay: 0.01
+  scheduler:
+    warmup_ratio: 0.1
+    cosine_min_ratio: 0.05
+  training:
+    epochs: 16
+    global_batch_size: 512
+invocation:
+  raw_root: ./data/raw
+  processed_root: ./data/processed_pretrain
+  metadata_root: ./share/metadata/pretrain
+  output_root: ./train_tokenizer_results
+  run_name: braintokenizer
+  batch_size_per_gpu: 16
+  num_workers: 32
+  preprocess_workers: 32
+  evaluation_modes: [test, ds005261-1.0.0, ds005697-1.0.2]
+  checkpoint_interval_epochs: 20
+  visualization_interval_steps: 200
+  deepspeed:
+    bf16:
+      enabled: true
+      auto_cast: true
+      loss_scale: 0.0
+      initial_scale_power: 16
+      loss_scale_window: 1000
+      hysteresis: 2
+      min_loss_scale: 1
+    zero_optimization:
+      stage: 2
+      offload_optimizer_device: cpu
+      offload_optimizer_pin_memory: true
+      overlap_comm: false
+      allgather_partitions: true
+      allgather_bucket_size: auto
+      reduce_scatter: true
+      reduce_bucket_size: auto

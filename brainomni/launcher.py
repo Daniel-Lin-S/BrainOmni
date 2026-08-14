@@ -1,16 +1,25 @@
-import os
-import json
-import torch
-import random
+"""Launch configurable BrainOmni pre-training."""
+
+from __future__ import annotations
+
 import argparse
-import numpy as np
-from constant import SEED, PROJECT_ROOT_PATH
+import os
 from datetime import datetime
-from brainomni.trainer import Trainer
+from pathlib import Path
+import random
+
+import numpy as np
+import torch
+
 from brainomni.config import BrainOmniTrainerConfig
+from brainomni.trainer import Trainer
+from pretrain_config import load_pretrain_config, write_run_artifacts
+
+DEFAULT_CONFIG = "configs/pretrain/brainomni.yaml"
 
 
-def seed_everything(seed):
+def seed_everything(seed: int) -> None:
+    """Seed all supported random number generators for a campaign."""
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -21,62 +30,61 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def parse_arg():
-    parser = argparse.ArgumentParser("")
+def parse_args() -> argparse.Namespace:
+    """Parse configuration and DeepSpeed-provided launch arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--launcher", type=str)
-    parser.add_argument("--signal_type", type=str)
-    parser.add_argument("--model_size", type=str)
-    parser.add_argument("--tokenizer_path", type=str)
-    parser.add_argument("--num_quantizers_used", type=int)
-    parser.add_argument("--epoch", type=int)
-    args = parser.parse_args()
-    return args
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--local-config", type=str)
+    parser.add_argument("--set", dest="overrides", action="append", default=[])
+    return parser.parse_args()
 
 
-def record_datetime_exp(rank, cfg_exp_name, model_cfg_json):
-    exp_name = "exp_" + datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    exp_path = os.path.join(
-        PROJECT_ROOT_PATH, "train_omni_results", cfg_exp_name, exp_name[:-3]
-    )
+def create_run_directory(
+    rank: int,
+    config: dict[str, object],
+    model_config: dict[str, object],
+    tokenizer_identity: dict[str, str],
+) -> str:
+    """Create a run directory and write configuration artifacts on rank zero."""
+    invocation = config["invocation"]
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_path = Path(invocation["output_root"]) / invocation["run_name"]
+    run_path = run_path / f"exp_{timestamp}"
     if rank == 0:
-        os.system(f"mkdir -p {exp_path}")
-        os.makedirs(os.path.join(exp_path, cfg_exp_name), exist_ok=True)
-        json.dump(
-            model_cfg_json,
-            open(os.path.join(exp_path, cfg_exp_name, "model_cfg.json"), "w"),
-            indent=4,
+        write_run_artifacts(
+            run_path,
+            config,
+            model_config,
+            tokenizer_identity,
         )
-    return exp_path
+    return str(run_path)
 
 
-if __name__ == "__main__":
-    args = parse_arg()
-
-    seed_everything(SEED)
+def main() -> None:
+    """Resolve settings and start distributed BrainOmni training."""
+    args = parse_args()
+    config = load_pretrain_config(args.config, args.local_config, args.overrides)
+    seed_everything(config["campaign"]["seed"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-
-    cfg = BrainOmniTrainerConfig(
-        signal_type=args.signal_type,
-        epoch=args.epoch,
-        model_size=args.model_size,
-        tokenizer_path=args.tokenizer_path,
-        num_quantizers_used=args.num_quantizers_used,
-        world_size=world_size,
-    )
-
-    exp_path = record_datetime_exp(
+    trainer_config = BrainOmniTrainerConfig(config, world_size)
+    run_path = create_run_directory(
         rank,
-        cfg.exp_name,
-        model_cfg_json=cfg.get_model_cfg(),
+        config,
+        trainer_config.get_model_cfg(),
+        trainer_config.tokenizer_identity,
     )
-
     Trainer(
-        cfg,
+        trainer_config,
         local_rank,
         rank,
         world_size,
-        exp_path=exp_path,
+        exp_path=run_path,
     ).main()
+
+
+if __name__ == "__main__":
+    main()

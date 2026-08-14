@@ -128,7 +128,7 @@ class Trainer:
         del self.val_loader
 
         self.logger.info("=> Start Testing ...")
-        for mode in ["test"] + NEW_DEVICE_DATASET_LIST:
+        for mode in self.cfg.evaluation_modes:
             self.test_loader = self.build_dataloader(mode=mode, ratio=1.0)
             self.metrics_computer = MetricsComputer()
             for i, self.input_dict in enumerate(self.test_loader):
@@ -221,7 +221,7 @@ class Trainer:
         loss = output_dict["loss"]
         self.model.backward(loss)
         self.model.step()
-        if self.train_step_counter % 200 == 0:
+        if self.train_step_counter % self.cfg.visualization_interval_steps == 0:
             self.model.eval()
             output_dict = self.model.visualize(**input_dict)
             self.write_visualize_result(
@@ -307,7 +307,7 @@ class Trainer:
         self.logger.info(f"code utilize entropy:{codebook_utilize_entropy.cpu()}")
         self.logger.info("")
 
-        if self.epoch % 20 == 0:
+        if self.epoch % self.cfg.checkpoint_interval_epochs == 0:
             self.save_ckpt(tag=f"epoch_{self.epoch}")
 
         if self.eval_running_dict["judge_loss"] < self.best_eval_loss:
@@ -333,7 +333,11 @@ class Trainer:
         load_path, client_state = self.model.load_checkpoint(load_dir=load_dir, tag=tag)
 
     def deepspeed_initialize(self):
-        model = BrainTokenizer(**self.cfg.get_model_cfg())
+        model = BrainTokenizer(
+            **self.cfg.get_model_cfg(),
+            channel_mask_ratio=self.cfg.channel_mask_ratio,
+            noise_std=self.cfg.noise_std,
+        )
         model, _, _, _ = deepspeed.initialize(
             model=model,
             model_parameters=model.get_parameters_groups(

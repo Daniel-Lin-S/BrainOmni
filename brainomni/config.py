@@ -1,147 +1,108 @@
-import os
+"""BrainOmni trainer configuration derived from resolved settings."""
+
+from __future__ import annotations
+
 import json
-from constant import (
-    SAMPLE_RATE,
-    LOW,
-    HIGH,
-    PRETRAIN_METADATA_PATH,
+from pathlib import Path
+from typing import Any, Mapping
+
+from pretrain_config import (
+    ConfigError,
+    build_deepspeed_config,
+    metadata_directory,
+    sha256_file,
 )
 
 
 class BrainOmniTrainerConfig:
-    def __init__(
-        self,
-        signal_type: str,
-        model_size: str,
-        tokenizer_path: str,
-        num_quantizers_used: int,
-        epoch: str,
-        world_size: int,
-    ):
-        self.signal_type = signal_type
-        self.exp_name = f"BrainOmni_epoch{epoch}_model_{model_size}_signal_{signal_type}_num_quantizers_{num_quantizers_used}_tokenizer_{tokenizer_path.split('/')[-1]}"
+    """Runtime view of a validated BrainOmni pre-training configuration."""
 
-        # dataset
-        TIME = 30
-        STRIDE = 30
-        self.pretrain_metadata_path = os.path.join(
-            PRETRAIN_METADATA_PATH,
-            f"sfreq_{SAMPLE_RATE}_low_{LOW}_high_{HIGH}_time_{TIME}_stride_{STRIDE}",
+    def __init__(self, settings: Mapping[str, Any], world_size: int):
+        campaign = settings["campaign"]
+        invocation = settings["invocation"]
+        tokenizer_directory = Path(invocation["tokenizer_path"])
+        self.settings = settings
+        self.signal_type = campaign["data"]["signal_type"]
+        self.exp_name = invocation["run_name"]
+        self.pretrain_metadata_path = str(metadata_directory(settings))
+        self.tokenizer_ckpt_path = str(tokenizer_directory / "BrainTokenizer.pt")
+        model_path = tokenizer_directory / "model_cfg.json"
+        if not model_path.is_file() or not Path(self.tokenizer_ckpt_path).is_file():
+            raise ConfigError(
+                "tokenizer_path must contain model_cfg.json and BrainTokenizer.pt."
+            )
+        self.tokenizer_identity = self._tokenizer_identity(
+            model_path, Path(self.tokenizer_ckpt_path), invocation
         )
-
-        # tokenizer parameter
-        self.tokenizer_ckpt_path = os.path.join(tokenizer_path, "BrainTokenizer.pt")
-        tokenizer_parameter = json.load(
-            open(os.path.join(tokenizer_path, "model_cfg.json"), "r")
-        )
-        self.window_length = tokenizer_parameter["window_length"]
-        self.n_filters = tokenizer_parameter["n_filters"]
-        self.ratios = tokenizer_parameter["ratios"]
-        self.kernel_size = tokenizer_parameter["kernel_size"]
-        self.last_kernel_size = tokenizer_parameter["last_kernel_size"]
-        self.n_dim = tokenizer_parameter["n_dim"]
-        self.n_neuro = tokenizer_parameter["n_neuro"]
-        self.n_head = tokenizer_parameter["n_head"]
-        self.dropout = tokenizer_parameter["dropout"]
-        self.codebook_dim = tokenizer_parameter["codebook_dim"]
-        self.codebook_size = tokenizer_parameter["codebook_size"]
-        self.num_quantizers = tokenizer_parameter["num_quantizers"]
-        self.rotation_trick = tokenizer_parameter["rotation_trick"]
-        self.quantize_optimize_method = tokenizer_parameter["quantize_optimize_method"]
-
-        # LM parameter
-        self.overlap_ratio = 0.25
-        self.num_quantizers_used = num_quantizers_used
-        self.lm_dropout = 0.1
-        self.mask_ratio = 0.5
-        # tokenizer 5M
-        if model_size == "tiny":
-            self.lm_dim = 256
-            self.lm_head = 8
-            self.lm_depth = 12
-            self.lr = 5e-4
-        elif model_size == "base":
-            self.lm_dim = 512
-            self.lm_head = 16
-            self.lm_depth = 12
-            self.lr = 4e-4
-
-        self.batch_size = 8
-        # 训练参数
-        self.weight_decay = 0.05
-        self.total_batch_per_update = 256
-
-        assert self.total_batch_per_update // (self.batch_size * world_size) > 0
-        self.gradient_accumulation_steps = self.total_batch_per_update // (
-            self.batch_size * world_size
-        )
-
-        self.num_workers = 32
-        self.epoch = epoch
+        tokenizer_model = json.loads(model_path.read_text(encoding="utf-8"))
+        for key, value in tokenizer_model.items():
+            setattr(self, key, value)
+        model = campaign["model"]
+        objective = campaign["objective"]
+        optimizer = campaign["optimizer"]
+        self.overlap_ratio = objective["overlap_ratio"]
+        self.mask_ratio = objective["mask_ratio"]
+        self.num_quantizers_used = objective["num_quantizers_used"]
+        self.lm_dim = model["lm_dim"]
+        self.lm_head = model["lm_head"]
+        self.lm_depth = model["lm_depth"]
+        self.lm_dropout = model["lm_dropout"]
+        self.batch_size = invocation["batch_size_per_gpu"]
+        self.num_workers = invocation["num_workers"]
+        self.epoch = campaign["training"]["epochs"]
         self.train_data_ratio = 1.0
         self.valid_data_ratio = 1.0
         self.test_data_ratio = 1.0
-        self.scheduler_warm_ratio = 0.1
+        self.lr = optimizer["lr"]
+        self.weight_decay = optimizer["weight_decay"]
+        self.scheduler_warm_ratio = campaign["scheduler"]["warmup_ratio"]
+        self.ds_config, self.gradient_accumulation_steps = build_deepspeed_config(
+            settings, world_size
+        )
+        self.evaluation_modes = invocation["evaluation_modes"]
+        self.checkpoint_interval_epochs = invocation["checkpoint_interval_epochs"]
 
-        self.ds_config = {
-            "train_micro_batch_size_per_gpu": self.batch_size,
-            "gradient_accumulation_steps": self.gradient_accumulation_steps,
-            "bf16": {
-                "enabled": True,
-                "auto_cast": True,
-                "loss_scale": 0.0,
-                "initial_scale_power": 16,
-                "loss_scale_window": 1000,
-                "hysteresis": 2,
-                "min_loss_scale": 1,
-            },
-            "optimizer": {
-                "type": "AdamW",
-                "params": {"betas": [0.9, 0.95], "eps": 1e-6},
-            },
-            "scheduler": {
-                "type": "WarmupCosineLR",
-                "params": {
-                    "total_num_steps": None,  # set when trainning
-                    "warmup_num_steps": None,  # set when trainning
-                    "warmup_min_ratio": 0.1,
-                    "cos_min_ratio": 0.1,
-                },
-            },
-            "zero_optimization": {
-                "stage": 2,
-                "offload_optimizer": {"device": "cpu", "pin_memory": True},
-                "overlap_comm": False,
-                "allgather_partitions": True,
-                "allgather_bucket_size": "auto",
-                "reduce_scatter": True,
-                "reduce_bucket_size": "auto",
-            },
+    @staticmethod
+    def _tokenizer_identity(
+        model_path: Path,
+        weights_path: Path,
+        invocation: Mapping[str, Any],
+    ) -> dict[str, str]:
+        identity = {
+            "model_config_sha256": sha256_file(model_path),
+            "weights_sha256": sha256_file(weights_path),
         }
+        expected = {
+            "model_config_sha256": invocation[
+                "expected_tokenizer_model_config_sha256"
+            ],
+            "weights_sha256": invocation["expected_tokenizer_weights_sha256"],
+        }
+        for key, digest in expected.items():
+            if digest is not None and digest != identity[key]:
+                raise ConfigError(
+                    f"Configured tokenizer {key} does not match the supplied file."
+                )
+        return identity
 
-    def get_model_cfg(self):
-        return {
-            # Tokenizer parameters
-            "window_length": self.window_length,
-            "n_filters": self.n_filters,
-            "ratios": self.ratios,
-            "kernel_size": self.kernel_size,
-            "last_kernel_size": self.last_kernel_size,
-            "n_dim": self.n_dim,
-            "n_head": self.n_head,
-            "n_neuro": self.n_neuro,
-            "dropout": self.dropout,
-            "codebook_dim": self.codebook_dim,
-            "codebook_size": self.codebook_size,
-            "num_quantizers": self.num_quantizers,
-            "rotation_trick": self.rotation_trick,
-            "quantize_optimize_method": self.quantize_optimize_method,
-            # LM parameters
-            "overlap_ratio": self.overlap_ratio,
-            "lm_dim": self.lm_dim,
-            "lm_head": self.lm_head,
-            "lm_depth": self.lm_depth,
-            "lm_dropout": self.lm_dropout,
-            "mask_ratio": self.mask_ratio,
-            "num_quantizers_used": self.num_quantizers_used,
+    def get_model_cfg(self) -> dict[str, Any]:
+        """Return the unchanged portable BrainOmni constructor configuration."""
+        tokenizer_keys = {
+            "window_length", "n_filters", "ratios", "kernel_size",
+            "last_kernel_size", "n_dim", "n_head", "n_neuro", "dropout",
+            "codebook_dim", "codebook_size", "num_quantizers",
+            "rotation_trick", "quantize_optimize_method",
         }
+        config = {key: getattr(self, key) for key in tokenizer_keys}
+        config.update(
+            {
+                "overlap_ratio": self.overlap_ratio,
+                "lm_dim": self.lm_dim,
+                "lm_head": self.lm_head,
+                "lm_depth": self.lm_depth,
+                "lm_dropout": self.lm_dropout,
+                "mask_ratio": self.mask_ratio,
+                "num_quantizers_used": self.num_quantizers_used,
+            }
+        )
+        return config

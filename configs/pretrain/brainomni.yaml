@@ -1,0 +1,71 @@
+schema_version: 1
+campaign:
+  stage: brainomni
+  seed: 42
+  data:
+    signal_type: both
+    included_datasets: ["*"]
+    split_ratios:
+      train: 0.85
+      validation: 0.10
+      test: 0.05
+    preprocessing:
+      sample_rate_hz: 256
+      low_frequency_hz: 0.1
+      high_frequency_hz: 96
+      segment_seconds: 30
+      stride_seconds: 30
+  model:
+    size: tiny
+    lm_dim: 256
+    lm_head: 8
+    lm_depth: 12
+    lm_dropout: 0.1
+  objective:
+    overlap_ratio: 0.25
+    mask_ratio: 0.5
+    num_quantizers_used: 4
+  optimizer:
+    type: AdamW
+    lr: 0.0005
+    betas: [0.9, 0.95]
+    eps: 0.000001
+    weight_decay: 0.05
+  scheduler:
+    warmup_ratio: 0.1
+    cosine_min_ratio: 0.1
+  training:
+    epochs: 32
+    global_batch_size: 256
+invocation:
+  raw_root: ./data/raw
+  processed_root: ./data/processed_pretrain
+  metadata_root: ./share/metadata/pretrain
+  output_root: ./train_omni_results
+  run_name: brainomni_tiny
+  tokenizer_path: ./ckpt_collection/braintokenizer
+  expected_tokenizer_model_config_sha256: null
+  expected_tokenizer_weights_sha256: null
+  batch_size_per_gpu: 8
+  num_workers: 32
+  preprocess_workers: 32
+  evaluation_modes: [test, ds005261-1.0.0, ds005697-1.0.2]
+  checkpoint_interval_epochs: 20
+  deepspeed:
+    bf16:
+      enabled: true
+      auto_cast: true
+      loss_scale: 0.0
+      initial_scale_power: 16
+      loss_scale_window: 1000
+      hysteresis: 2
+      min_loss_scale: 1
+    zero_optimization:
+      stage: 2
+      offload_optimizer_device: cpu
+      offload_optimizer_pin_memory: true
+      overlap_comm: false
+      allgather_partitions: true
+      allgather_bucket_size: auto
+      reduce_scatter: true
+      reduce_bucket_size: auto

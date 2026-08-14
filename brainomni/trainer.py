@@ -117,7 +117,7 @@ class Trainer:
         del self.val_loader
 
         self.logger.info("=> Start Testing ...")
-        for mode in ["test"] + NEW_DEVICE_DATASET_LIST:
+        for mode in self.cfg.evaluation_modes:
             self.test_loader = self.build_dataloader(mode=mode, ratio=1.0)
             if len(self.test_loader) == 0:
                 continue
@@ -223,7 +223,7 @@ class Trainer:
             )
 
         self.logger.info("")
-        if self.epoch % 20 == 0:
+        if self.epoch % self.cfg.checkpoint_interval_epochs == 0:
             self.save_ckpt(tag=f"epoch_{self.epoch}")
         if self.epoch == self.total_epoch:
             self.save_ckpt(tag="last")
