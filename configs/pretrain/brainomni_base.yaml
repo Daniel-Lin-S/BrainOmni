@@ -16,9 +16,8 @@ campaign:
       segment_seconds: 30
       stride_seconds: 30
   model:
-    size: tiny
-    lm_dim: 256
-    lm_head: 8
+    lm_dim: 512
+    lm_head: 16
     lm_depth: 12
     lm_dropout: 0.1
   objective:
@@ -27,7 +26,7 @@ campaign:
     num_quantizers_used: 4
   optimizer:
     type: AdamW
-    lr: 0.0005
+    lr: 0.0004
     betas: [0.9, 0.95]
     eps: 0.000001
     weight_decay: 0.05
@@ -38,12 +37,12 @@ campaign:
     epochs: 32
     global_batch_size: 256
 invocation:
-  raw_root: ./data/raw
-  processed_root: ./data/processed_pretrain
-  metadata_root: ./share/metadata/pretrain
-  output_root: ./train_omni_results
-  run_name: brainomni_tiny
-  tokenizer_path: ./ckpt_collection/braintokenizer
+  raw_root: null
+  processed_root: null
+  metadata_root: null
+  output_root: null
+  run_name: brainomni_base
+  tokenizer_path: null
   expected_tokenizer_model_config_sha256: null
   expected_tokenizer_weights_sha256: null
   batch_size_per_gpu: 8

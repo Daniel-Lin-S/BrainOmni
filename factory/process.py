@@ -11,7 +11,12 @@ from factory.utils import (
 )
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from accessor import DataAccessor
-from pretrain_config import load_pretrain_config, metadata_directory
+from pretrain_config import (
+    load_pretrain_config,
+    metadata_directory,
+    resolve_dataset_identities,
+)
+
 
 def seed_everything(seed):
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -42,7 +47,7 @@ def get_logger():
 
 def parse_arg():
     parser = argparse.ArgumentParser("")
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", nargs="+", required=True)
     parser.add_argument("--local-config", type=str)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args()
@@ -99,7 +104,9 @@ if __name__ == "__main__":
     brain_files = [i for i in brain_files if i["path"] not in finish]
     if selected_datasets != ["*"]:
         brain_files = [
-            item for item in brain_files if item["dataset"] in selected_datasets
+            item
+            for item in brain_files
+            if item["dataset"] in selected_datasets
         ]
 
     logger.info("start processing...")
@@ -143,6 +150,12 @@ if __name__ == "__main__":
     with open(info_path, "w") as f:
         json.dump(metadata_list, f)
 
+    config = resolve_dataset_identities(config)
+    logger.info(
+        "resolved preprocessing datasets: %s",
+        config["campaign"]["data"]["included_datasets"],
+    )
+
     seed_everything(seed=config["campaign"]["seed"])
     train, val, test, new_device_dataset_dict = split_pretrain_metadata(
         metadata_list,
@@ -155,5 +168,7 @@ if __name__ == "__main__":
     with open(os.path.join(pretrain_metadata_path, "test.json"), "w") as f:
         json.dump(test, f, indent=4)
     for dataset in new_device_dataset_dict.keys():
-        with open(os.path.join(pretrain_metadata_path, f"{dataset}.json"), "w") as f:
+        with open(
+            os.path.join(pretrain_metadata_path, f"{dataset}.json"), "w"
+        ) as f:
             json.dump(new_device_dataset_dict[dataset], f, indent=4)

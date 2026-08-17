@@ -11,10 +11,10 @@ from einops import rearrange
 from torch.utils.tensorboard import SummaryWriter
 from accessor import DataAccessor
 from pretrain_dataset import build_brain_bucket_dataloader
+from factory.checkpoint import convert_best_checkpoint
 from braintokenizer.config import BrainTokenizerTrainerConfig
 from braintokenizer.model import BrainTokenizer
 from braintokenizer.metrics import MetricsComputer
-from constant import NEW_DEVICE_DATASET_LIST
 
 
 def batched_bincount(x, num_classes, dim):
@@ -59,9 +59,7 @@ class Trainer:
         self.exp_path = exp_path
         self.ckpt_path = os.path.join(self.exp_path, "checkpoint")
         os.makedirs(self.ckpt_path, exist_ok=True)
-        self.accessor = DataAccessor(
-            read_only=True
-        )
+        self.accessor = DataAccessor(read_only=True)
 
         # configuration
         self.epoch = 0
@@ -73,7 +71,9 @@ class Trainer:
 
         self.logger.info("=> Building train dataloader ...")
         self.train_loader = self.build_dataloader(
-            mode="train", ratio=self.cfg.train_data_ratio, persistent_workers=True
+            mode="train",
+            ratio=self.cfg.train_data_ratio,
+            persistent_workers=True,
         )
         self.logger.info("=> Building val dataloader ...")
         self.val_loader = self.build_dataloader(
@@ -91,7 +91,9 @@ class Trainer:
         self.logger.info(
             "=> Building model and initializing distributed environment..."
         )
-        self.cfg.ds_config["scheduler"]["params"]["total_num_steps"] = train_total_steps
+        self.cfg.ds_config["scheduler"]["params"][
+            "total_num_steps"
+        ] = train_total_steps
         self.cfg.ds_config["scheduler"]["params"]["warmup_num_steps"] = int(
             train_total_steps * self.cfg.scheduler_warm_ratio
         )
@@ -122,7 +124,9 @@ class Trainer:
                     self.eval_step()
             self.after_epoch()
         self.logger.info(">>>>>>>>>>>>>>>> Finish Training >>>>>>>>>>>>>>>>")
-        self.load_ckpt(load_dir=os.path.join(self.exp_path, "checkpoint"), tag="best")
+        self.load_ckpt(
+            load_dir=os.path.join(self.exp_path, "checkpoint"), tag="best"
+        )
         self.model.eval()
         del self.train_loader
         del self.val_loader
@@ -141,22 +145,61 @@ class Trainer:
                 )
                 if i % 10 == 0:
                     self.write_visualize_result(
-                        output_dict["x"], output_dict["x_rec"], tag=mode, global_step=i
+                        output_dict["x"],
+                        output_dict["x_rec"],
+                        tag=mode,
+                        global_step=i,
                     )
             metrics = self.metrics_computer.get_metrics()
             for type in metrics.keys():
                 for key in metrics[type].keys():
-                    metrics[type][key] = self.scalar_comm_reduce(metrics[type][key])
-            with open(os.path.join(self.exp_path, f"{mode}_metrics.json"), "w") as f:
+                    metrics[type][key] = self.scalar_comm_reduce(
+                        metrics[type][key]
+                    )
+            with open(
+                os.path.join(self.exp_path, f"{mode}_metrics.json"), "w"
+            ) as f:
                 json.dump(metrics, f, indent=4)
         self.writer.close()
+        self.export_best_checkpoint()
         dist.destroy_process_group()
+
+    def export_best_checkpoint(self) -> None:
+        """Export the rank-zero best checkpoint without blocking peer ranks."""
+        dist.barrier()
+        conversion_failed = torch.zeros(
+            (1,),
+            device=self.local_rank,
+            dtype=torch.int32,
+        )
+        if self.rank == 0:
+            try:
+                output_path = convert_best_checkpoint(self.exp_path)
+            except Exception as error:
+                conversion_failed.fill_(1)
+                self.logger.info(
+                    "Failed to export the best tokenizer checkpoint: %s",
+                    error,
+                )
+            else:
+                self.logger.info(
+                    "Exported the best tokenizer checkpoint to %s.",
+                    output_path,
+                )
+        dist.all_reduce(conversion_failed, op=dist.ReduceOp.MAX)
+        if conversion_failed.item():
+            raise RuntimeError(
+                "Rank zero could not export the best BrainTokenizer checkpoint."
+            )
+        dist.barrier()
 
     def count_epoch(self):
         self.epoch += 1
 
     def before_epoch(self):
-        self.logger.info(f">>>>>>>>>>>>>>>> Epoch {self.epoch} >>>>>>>>>>>>>>>>")
+        self.logger.info(
+            f">>>>>>>>>>>>>>>> Epoch {self.epoch} >>>>>>>>>>>>>>>>"
+        )
         self.eval_running_indices = []
         self.train_running_dict = {
             "loss": 0.0,
@@ -208,7 +251,9 @@ class Trainer:
         self.writer.add_figure(
             tag,
             plt.gcf(),
-            global_step=self.train_step_counter if global_step is None else global_step,
+            global_step=(
+                self.train_step_counter if global_step is None else global_step
+            ),
         )
         plt.close()
 
@@ -221,7 +266,10 @@ class Trainer:
         loss = output_dict["loss"]
         self.model.backward(loss)
         self.model.step()
-        if self.train_step_counter % self.cfg.visualization_interval_steps == 0:
+        if (
+            self.train_step_counter % self.cfg.visualization_interval_steps
+            == 0
+        ):
             self.model.eval()
             output_dict = self.model.visualize(**input_dict)
             self.write_visualize_result(
@@ -255,11 +303,15 @@ class Trainer:
     def after_epoch(self):
         torch.cuda.empty_cache()
         indices = (
-            torch.vstack(self.eval_running_indices).transpose(0, 1).to(self.local_rank)
+            torch.vstack(self.eval_running_indices)
+            .transpose(0, 1)
+            .to(self.local_rank)
         )
         codebook_count = batched_bincount(indices, self.cfg.codebook_size, -1)
         dist.all_reduce(codebook_count, op=dist.ReduceOp.SUM)
-        codebook_count = codebook_count / codebook_count.sum(dim=-1, keepdim=True)
+        codebook_count = codebook_count / codebook_count.sum(
+            dim=-1, keepdim=True
+        )
         codebook_utilize_entropy = -torch.sum(
             codebook_count * torch.log2(codebook_count + 1e-6), dim=-1
         )
@@ -302,9 +354,12 @@ class Trainer:
                 global_step=self.epoch,
             )
             self.logger.info(
-                f"train {key}:{self.train_running_dict[key]} eval {key}:{self.eval_running_dict[key]}"
+                f"train {key}:{self.train_running_dict[key]} "
+                f"eval {key}:{self.eval_running_dict[key]}"
             )
-        self.logger.info(f"code utilize entropy:{codebook_utilize_entropy.cpu()}")
+        self.logger.info(
+            f"code utilize entropy:{codebook_utilize_entropy.cpu()}"
+        )
         self.logger.info("")
 
         if self.epoch % self.cfg.checkpoint_interval_epochs == 0:
@@ -330,13 +385,14 @@ class Trainer:
         )
 
     def load_ckpt(self, load_dir: str, tag: str):
-        load_path, client_state = self.model.load_checkpoint(load_dir=load_dir, tag=tag)
+        load_path, client_state = self.model.load_checkpoint(
+            load_dir=load_dir, tag=tag
+        )
 
     def deepspeed_initialize(self):
         model = BrainTokenizer(
             **self.cfg.get_model_cfg(),
             channel_mask_ratio=self.cfg.channel_mask_ratio,
-            noise_std=self.cfg.noise_std,
         )
         model, _, _, _ = deepspeed.initialize(
             model=model,
@@ -347,7 +403,9 @@ class Trainer:
             ),
             config=self.cfg.ds_config,
         )
-        n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_parameters = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
         self.logger.info(f"Num params: {n_parameters/1.0e9} B")
         return model
 

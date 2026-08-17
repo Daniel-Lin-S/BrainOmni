@@ -143,6 +143,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.vscode/
+.conda/
 
 # Spyder project settings
 .spyderproject
@@ -216,3 +218,4 @@ data/
 # Machine-local pre-training overrides
 configs/pretrain/*.local.yaml
 configs/pretrain/*.local.yml
+docs/*.local.md

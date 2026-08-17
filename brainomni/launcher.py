@@ -13,9 +13,11 @@ import torch
 
 from brainomni.config import BrainOmniTrainerConfig
 from brainomni.trainer import Trainer
-from pretrain_config import load_pretrain_config, write_run_artifacts
-
-DEFAULT_CONFIG = "configs/pretrain/brainomni.yaml"
+from pretrain_config import (
+    load_pretrain_config,
+    resolve_dataset_identities,
+    write_run_artifacts,
+)
 
 
 def seed_everything(seed: int) -> None:
@@ -35,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--launcher", type=str)
-    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--config", nargs="+", required=True)
     parser.add_argument("--local-config", type=str)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     return parser.parse_args()
@@ -65,7 +67,10 @@ def create_run_directory(
 def main() -> None:
     """Resolve settings and start distributed BrainOmni training."""
     args = parse_args()
-    config = load_pretrain_config(args.config, args.local_config, args.overrides)
+    config = load_pretrain_config(
+        args.config, args.local_config, args.overrides
+    )
+    config = resolve_dataset_identities(config)
     seed_everything(config["campaign"]["seed"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])

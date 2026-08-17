@@ -1,6 +1,6 @@
 schema_version: 1
 campaign:
-  stage: braintokenizer
+  stage: brainomni
   seed: 42
   data:
     signal_type: both
@@ -13,50 +13,43 @@ campaign:
       sample_rate_hz: 256
       low_frequency_hz: 0.1
       high_frequency_hz: 96
-      segment_seconds: 10
-      stride_seconds: 10
+      segment_seconds: 30
+      stride_seconds: 30
   model:
-    window_length: 512
-    n_filters: 32
-    ratios: [8, 4, 2]
-    kernel_size: 5
-    last_kernel_size: 5
-    n_dim: 256
-    n_neuro: 16
-    n_head: 4
-    dropout: 0.0
-    codebook_dim: 256
-    codebook_size: 512
-    num_quantizers: 4
-    rotation_trick: true
-    quantize_optimize_method: ema
+    lm_dim: 256
+    lm_head: 8
+    lm_depth: 12
+    lm_dropout: 0.1
   objective:
-    channel_mask_ratio: 0.25
+    overlap_ratio: 0.25
+    mask_ratio: 0.5
+    num_quantizers_used: 4
   optimizer:
     type: AdamW
-    lr: 0.0002
-    codebook_lr: 0.0003
-    betas: [0.5, 0.9]
-    eps: 0.00001
-    weight_decay: 0.01
+    lr: 0.0005
+    betas: [0.9, 0.95]
+    eps: 0.000001
+    weight_decay: 0.05
   scheduler:
     warmup_ratio: 0.1
-    cosine_min_ratio: 0.05
+    cosine_min_ratio: 0.1
   training:
-    epochs: 16
-    global_batch_size: 512
+    epochs: 32
+    global_batch_size: 256
 invocation:
   raw_root: null
   processed_root: null
   metadata_root: null
   output_root: null
-  run_name: braintokenizer
-  batch_size_per_gpu: 16
+  run_name: brainomni_tiny
+  tokenizer_path: null
+  expected_tokenizer_model_config_sha256: null
+  expected_tokenizer_weights_sha256: null
+  batch_size_per_gpu: 8
   num_workers: 32
   preprocess_workers: 32
   evaluation_modes: [test, ds005261-1.0.0, ds005697-1.0.2]
   checkpoint_interval_epochs: 20
-  visualization_interval_steps: 200
   deepspeed:
     bf16:
       enabled: true

@@ -73,7 +73,6 @@ class BrainTokenizer(nn.Module):
         self.n_dim = n_dim
         self.sensor_embed = BrainSensorModule(n_dim)
         self.mask_ratio = kwargs.get("channel_mask_ratio", 0.25)
-        self.noise_std = kwargs.get("noise_std", 0.1)
 
         self.encoder = BrainTokenizerEncoder(
             n_filters=n_filters,
@@ -161,9 +160,6 @@ class BrainTokenizer(nn.Module):
         x = x - x.mean(dim=-1, keepdim=True)
         x = x / (x.std(dim=-1,keepdim=True)+1e-6)
         return x
-
-    def add_noise(self, x: torch.Tensor):
-        return x + torch.randn_like(x) * self.noise_std
 
     def forward(
         self, x: torch.Tensor, pos: torch.Tensor, sensor_type: torch.Tensor, **kwargs

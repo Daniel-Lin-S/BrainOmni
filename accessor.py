@@ -3,6 +3,7 @@ import io
 import mne
 import json
 import torch
+from pathlib import Path
 from constant import DATA_ROOT_PATH
 from tqdm import tqdm
 BRAIN_EXTENSION = ["con", "fif", "set", "bdf", "edf", "vhdr", "ds"]
@@ -90,6 +91,10 @@ class DataAccessor:
         return path.replace(DATA_ROOT_PATH, "").split("/")[0]
 
     def get_dataset_folder_name(self, path: str):
+        resolved_path = Path(path).resolve()
+        for parent in resolved_path.parents:
+            if (parent / "dataset_description.json").is_file():
+                return parent.name
         return path.replace(DATA_ROOT_PATH, "").split("/")[1]
 
     def replace_usage_folder_name(self, path: str, new_usage: str):

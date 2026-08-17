@@ -78,57 +78,26 @@ checkpoint-export workflow, see
 [Pre-training configuration](docs/pretraining_configuration.md).
 
 ### Data preprocessing
-To preprocess pretraining datasets, run 
-```bash
-# see script/pretrain_preprocess.sh
-python factory/process.py --time xx --stride xx --max_workers xx
-```
-- `time`: Duration of each data segment (unit in second).
-- `stride`: stride when segmenting
+
+Run `factory/process.py` with the same tracked configuration and ignored local
+overlay that will be used for training. The configuration reference contains
+the supported layered command syntax and metadata-verification requirements.
 
 When incorporating a new dataset, place its custom montage file (if applicable) into `share/custom_montages`, and update the `CUSTOM_MONTAGE_DICT` in `factory/brain_constant.py`. If no custom montage is provided, define a standard MNE montage in the `MONTAGE_DICT` within the same file.
 
 ### Model training
-For BrainTokenizer pretraining, run the command as follows:
-```bash
-# see script/train_braintokenizer.sh
-export PYTHONPATH=./
-deepspeed  --num_gpus=8 \
-   braintokenizer/launcher.py \
-   --launcher=pdsh \
-   --signal_type=both \
-   --epoch=16 \
-   --codebook_size=512 \
-   --codebook_dim=256 \
-   --num_quantizers=4 
-```
 
+Pre-training is configured only through the tracked YAML defaults and ignored
+local overlays. See [the configuration reference](docs/pretraining_configuration.md)
+for the schema, layered launch syntax, and artifact contract.
 
-The procedure for BrainOmni pretraining (Stage 2) is similar. Refer to `script/train_brainomni.sh` for detailed instructions.
-
-After training, checkpoints will be organized as follows within `train_omni_results` or `train_tokenizer_results`
-```plaintext
-exp_2025-07-02_12:00
-├── exp_name
-│   └── model_cfg.json
-├── checkpoint
-│   ├── best
-│   ├── latest
-│   └── zero_to_fp32.py
-├── events.out.tfevents.xxx
-└── logs.txt
-```
-To convert DeepSpeed checkpoints to standard PyTorch format, navigate to the `checkpoint` directory and execute:
-```bash
-./zero_to_fp32.py . output_directory
-```
-
-The converted checkpoint (`pytorch_model.bin`) will be stored in `output_directory`. Rename it accordingly (e.g., `BrainTokenizer.pt` or `BrainOmni.pt`) and relocate it to the same folder of `model_cfg.json`. This combined directory will be used for setting `tokenizer_path` or `ckpt_path` in shell scripts.
+A successful Stage-1 run writes `BrainTokenizer.pt` automatically beside
+`model_cfg.json`; use that run directory as the Stage-2 tokenizer artifact.
 
 ## ⛵ Downstream finetuning
 
 ### Data preprocessing
-1. Put the downstream dataset under ./data/evaluate/
+1. Set the downstream dataset location in your ignored local configuration.
 2. Run the corresponding preprocessing code : `python downstream/dataset_maker/make_xx.py`
 3. Run `python downstream/dataset_maker/dataset_spliter.py` to split the data into 5-fold(cross-subject). 
 
