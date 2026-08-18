@@ -48,7 +48,6 @@ def get_logger():
 def parse_arg():
     parser = argparse.ArgumentParser("")
     parser.add_argument("--config", nargs="+", required=True)
-    parser.add_argument("--local-config", type=str)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args()
     return args
@@ -56,9 +55,7 @@ def parse_arg():
 
 if __name__ == "__main__":
     args = parse_arg()
-    config = load_pretrain_config(
-        args.config, args.local_config, args.overrides
-    )
+    config = load_pretrain_config(args.config, overrides=args.overrides)
     preprocessing = config["campaign"]["data"]["preprocessing"]
     invocation = config["invocation"]
     TIME = preprocessing["segment_seconds"]

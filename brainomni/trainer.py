@@ -12,7 +12,7 @@ from brainomni.model import BrainOmni
 from pretrain_dataset import build_brain_bucket_dataloader
 from constant import NEW_DEVICE_DATASET_LIST
 
-
+from pretrain_config import repository_log_directory
 class EmptyLogger:
     def info(self, *awargs, **kwargs):
         return None
@@ -301,8 +301,13 @@ class Trainer:
             "%H:%M:%S",
         )
 
+        log_directory = repository_log_directory(
+            self.exp_path,
+            "brainomni",
+        )
+        log_directory.mkdir(parents=True, exist_ok=True)
         fileHandler = logging.FileHandler(
-            f"{self.exp_path}/logs.txt",
+            log_directory / "logs.txt",
             encoding="utf-8",
         )
         fileHandler.setLevel(logging.INFO)

@@ -219,3 +219,4 @@ data/
 configs/pretrain/*.local.yaml
 configs/pretrain/*.local.yml
 docs/*.local.md
+logs/

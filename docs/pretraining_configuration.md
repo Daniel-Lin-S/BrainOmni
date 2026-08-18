@@ -10,13 +10,12 @@ and `*.local.md` files. They are intentionally not documented here.
 ## 1. Configuration precedence and launch flow
 
 ```bash
-deepspeed --num_gpus=N braintokenizer/launcher.py \
-  --config configs/pretrain/braintokenizer.yaml --local-config LOCAL_FILE
+deepspeed --num_gpus=N braintokenizer/launcher.py --config configs/pretrain/braintokenizer.yaml LOCAL_FILE
 ```
 
-Additional `--config` files merge left-to-right. The optional local overlay
-merges after every tracked layer, and repeated `--set section.key=<JSON value>`
-overrides merge last. Validation runs only after the final complete merge.
+All `--config` files merge left-to-right; pass an ignored local overlay after
+the tracked layers. Repeated `--set section.key=<JSON value>` overrides merge
+last. Validation runs only after the final complete merge.
 There is no generic Stage-2 default: select `brainomni_tiny.yaml` or
 `brainomni_base.yaml` explicitly.
 
@@ -25,11 +24,11 @@ dimensions, 8 heads, 12 layers, and `5e-4`; base is 512 dimensions, 16 heads,
 12 layers, and `4e-4`.
 
 ```bash
-deepspeed --num_gpus=N brainomni/launcher.py --config configs/pretrain/brainomni_tiny.yaml --local-config LOCAL_FILE
+deepspeed --num_gpus=N brainomni/launcher.py --config configs/pretrain/brainomni_tiny.yaml LOCAL_FILE
 ```
 
 ```bash
-deepspeed --num_gpus=N brainomni/launcher.py --config configs/pretrain/brainomni_base.yaml --local-config LOCAL_FILE
+deepspeed --num_gpus=N brainomni/launcher.py --config configs/pretrain/brainomni_base.yaml LOCAL_FILE
 ```
 
 ## 2. Campaign-wide settings
@@ -111,7 +110,7 @@ Invocation settings affect execution only and are saved in a run's `invocation.y
 
 | Key | Type/default | Effect |
 | --- | --- | --- |
-| `invocation.raw_root` | non-empty local string, `null` | Source recordings; required in local overlay. |
+| `invocation.raw_root` | non-empty local string, `null` | Source recordings; required in a local config layer. |
 | `invocation.processed_root` | non-empty local string, `null` | Processed tensor destination. |
 | `invocation.metadata_root` | non-empty local string, `null` | Preprocessing metadata destination. |
 | `invocation.output_root` | non-empty local string, `null` | Run-artifact destination. |
@@ -143,8 +142,8 @@ Invocation settings affect execution only and are saved in a run's `invocation.y
 
 ## 6. Resolution, artifacts, and validation
 
-Tracked YAML layers merge left-to-right, then the local overlay and repeatable
-`--set` overrides apply. Unknown or missing keys, invalid ranges, non-integer
+All YAML layers merge left-to-right, then repeatable `--set` overrides apply.
+Unknown or missing keys, invalid ranges, non-integer
 dimensions or batch values, non-boolean flags, malformed lowercase SHA-256
 values, invalid split fractions, and incompatible global batches fail early.
 

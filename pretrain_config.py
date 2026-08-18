@@ -437,8 +437,8 @@ def _validate_invocation(invocation: Any, stage: str) -> None:
     for key in path_keys:
         if not isinstance(values[key], str) or not values[key]:
             raise ConfigError(
-                f"invocation.{key} must be set in --local-config; public "
-                "configurations do not contain machine-local paths."
+                f"invocation.{key} must be set in a local --config layer; "
+                "public configurations do not contain machine-local paths."
             )
     if not isinstance(values["run_name"], str) or not values["run_name"]:
         raise ConfigError("invocation.run_name must be a non-empty string.")
@@ -550,6 +550,30 @@ def _validate_invocation(invocation: Any, stage: str) -> None:
                 raise ConfigError(
                     f"invocation.{key} must be a SHA-256 or null."
                 )
+
+
+def repository_log_directory(run_directory: str | Path, stage: str) -> Path:
+    """Return the repository-managed text-log directory for one run.
+
+    Parameters
+    ----------
+    run_directory : str or pathlib.Path
+        Run artifact directory with ``<run_name>/exp_<timestamp>`` layout.
+    stage : str
+        Pre-training stage name.
+
+    Returns
+    -------
+    pathlib.Path
+        Directory for rank-zero text logs.
+    """
+    run_path = Path(run_directory)
+    if stage not in {"braintokenizer", "brainomni"}:
+        raise ConfigError(f"Unsupported pre-training log stage: {stage}")
+    return (
+        Path(__file__).resolve().parent / "logs" / stage
+        / run_path.parent.name / run_path.name
+    )
 
 
 def metadata_directory(config: Mapping[str, Any]) -> Path:

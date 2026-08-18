@@ -22,6 +22,7 @@ from pretrain_config import (
     load_pretrain_config,
     metadata_directory,
     resolve_dataset_identities,
+    repository_log_directory,
     validate_pretrain_config,
     write_run_artifacts,
 )
@@ -224,6 +225,16 @@ class PretrainConfigTest(unittest.TestCase):
         self.assertEqual(base["campaign"]["model"]["lm_depth"], 12)
         self.assertEqual(base["campaign"]["optimizer"]["lr"], 0.0004)
         self.assertFalse((ROOT / "configs/pretrain/brainomni.yaml").exists())
+
+    def test_repository_log_directory_is_outside_run_artifacts(self) -> None:
+        run_path = ROOT / "temporary-artifacts" / "braintokenizer" / "exp_1"
+        log_path = repository_log_directory(run_path, "braintokenizer")
+        self.assertEqual(
+            log_path,
+            ROOT / "logs" / "braintokenizer" / "braintokenizer" / "exp_1",
+        )
+        with self.assertRaises(ConfigError):
+            repository_log_directory(run_path, "unknown")
 
     def test_stage_two_records_actual_tokenizer_identity(self) -> None:
         tokenizer_model = {

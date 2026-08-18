@@ -38,7 +38,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--launcher", type=str)
     parser.add_argument("--config", nargs="+", required=True)
-    parser.add_argument("--local-config", type=str)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     return parser.parse_args()
 
@@ -67,9 +66,7 @@ def create_run_directory(
 def main() -> None:
     """Resolve settings and start distributed BrainOmni training."""
     args = parse_args()
-    config = load_pretrain_config(
-        args.config, args.local_config, args.overrides
-    )
+    config = load_pretrain_config(args.config, overrides=args.overrides)
     config = resolve_dataset_identities(config)
     seed_everything(config["campaign"]["seed"])
     rank = int(os.environ["RANK"])

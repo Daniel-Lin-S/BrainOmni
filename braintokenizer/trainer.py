@@ -15,7 +15,7 @@ from factory.checkpoint import convert_best_checkpoint
 from braintokenizer.config import BrainTokenizerTrainerConfig
 from braintokenizer.model import BrainTokenizer
 from braintokenizer.metrics import MetricsComputer
-
+from pretrain_config import repository_log_directory
 
 def batched_bincount(x, num_classes, dim):
     target = torch.zeros(
@@ -440,8 +440,13 @@ class Trainer:
             "%H:%M:%S",
         )
 
+        log_directory = repository_log_directory(
+            self.exp_path,
+            "braintokenizer",
+        )
+        log_directory.mkdir(parents=True, exist_ok=True)
         fileHandler = logging.FileHandler(
-            f"{self.exp_path}/logs.txt",
+            log_directory / "logs.txt",
             encoding="utf-8",
         )
         fileHandler.setLevel(logging.INFO)
