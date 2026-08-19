@@ -1,0 +1,5 @@
+# Copy this file to datasets.local.yaml and replace the placeholders.
+datasets:
+  DATASET_ID:
+    path: null
+    signal_type: eeg

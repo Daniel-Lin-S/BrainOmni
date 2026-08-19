@@ -95,7 +95,6 @@ def build_brain_bucket_dataloader(
     ratio,
     metadata_path,
     accessor,
-    signal_type: str,
     rank: int,
     world_size: int,
     batch_size: int,
@@ -104,15 +103,15 @@ def build_brain_bucket_dataloader(
 ):
     with open(os.path.join(metadata_path, f"{mode}.json"), "r") as f:
         metadata_list = json.load(f)
-    if signal_type == "eeg":
-        metadata_list = [i for i in metadata_list if i["is_eeg"]]
-    elif signal_type == "meg":
-        metadata_list = [i for i in metadata_list if i["is_meg"]]
     # 多卡划分
     channels_set = sorted(set([i["channels"] for i in metadata_list]))
     replicated_metadata_list = []
     for channels in channels_set:
-        channel_metadata_list = [i for i in metadata_list if i["channels"] == channels]
+        channel_metadata_list = [
+            item
+            for item in metadata_list
+            if item["channels"] == channels
+        ]
         random.shuffle(channel_metadata_list)
         channel_metadata_list = channel_metadata_list[
             : int(len(channel_metadata_list) * ratio)
@@ -121,7 +120,9 @@ def build_brain_bucket_dataloader(
         replicated_metadata_list += channel_metadata_list[
             rank * len_replicas : (rank + 1) * len_replicas
         ]
-        replicated_metadata_list += channel_metadata_list[world_size * len_replicas :]
+        replicated_metadata_list += channel_metadata_list[
+            world_size * len_replicas :
+        ]
     brain_dataset = BrainDataset(
         metadata_list=replicated_metadata_list, accessor=accessor
     )

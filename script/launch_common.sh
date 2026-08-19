@@ -47,8 +47,13 @@ create_terminal_log() {
     local timestamp
 
     timestamp="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
-    TERMINAL_LOG_DIRECTORY="${PROJECT_ROOT}/logs/${stage}"
-    TERMINAL_LOG_PATH="${TERMINAL_LOG_DIRECTORY}/${timestamp}-$$.log"
+    BRAINOMNI_ATTEMPT_ID="${timestamp}-$$"
+    TERMINAL_LOG_DIRECTORY="${PROJECT_ROOT}/logs/${stage}/pending"
+    TERMINAL_LOG_DIRECTORY+="/${BRAINOMNI_ATTEMPT_ID}"
+    TERMINAL_LOG_PATH="${TERMINAL_LOG_DIRECTORY}/terminal.log"
+    BRAINOMNI_TERMINAL_LOG_PATH="${TERMINAL_LOG_PATH}"
+    export BRAINOMNI_ATTEMPT_ID
+    export BRAINOMNI_TERMINAL_LOG_PATH
     mkdir -p "${TERMINAL_LOG_DIRECTORY}"
 }
 

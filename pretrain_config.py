@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from hashlib import sha256
 import json
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -21,7 +22,6 @@ COMMON_CAMPAIGN = {
     "training",
 }
 DATA_KEYS = {
-    "signal_type",
     "included_datasets",
     "split_ratios",
     "preprocessing",
@@ -34,15 +34,15 @@ PREPROCESSING_KEYS = {
     "stride_seconds",
 }
 BASE_INVOCATION = {
-    "raw_root",
     "processed_root",
     "metadata_root",
     "output_root",
     "run_name",
+    "data_catalog",
     "batch_size_per_gpu",
     "num_workers",
     "preprocess_workers",
-    "evaluation_modes",
+    "held_out_evaluation_datasets",
     "checkpoint_interval_epochs",
     "deepspeed",
 }
@@ -88,22 +88,117 @@ class ConfigError(ValueError):
     """Raised when a configuration is incomplete or inconsistent."""
 
 
+DATA_CATALOG_PATH = (
+    Path(__file__).resolve().parent / "configs/data/datasets.local.yaml"
+)
+
+
 def load_pretrain_config(
     config_paths: str | Path | Sequence[str | Path],
-    local_config_path: str | Path | None = None,
     overrides: list[str] | None = None,
+    data_catalog_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Load layered configs, a local overlay, and CLI overrides."""
+    """Load configuration layers and CLI overrides."""
     paths = _config_paths(config_paths)
     config: dict[str, Any] = {}
     for path in paths:
         config = _merge(config, _load_mapping(path))
-    if local_config_path is not None:
-        config = _merge(config, _load_mapping(Path(local_config_path)))
     for override in overrides or []:
         _apply_override(config, override)
+    if data_catalog_path is not None:
+        invocation = config.get("invocation")
+        if not isinstance(invocation, dict):
+            raise ConfigError(
+                "invocation must be a mapping before catalog loading."
+            )
+        invocation["data_catalog"] = load_data_catalog(data_catalog_path)
     validate_pretrain_config(config)
     return config
+
+
+def load_pretrain_launch_config(
+    config_paths: str | Path | Sequence[str | Path],
+    overrides: list[str] | None = None,
+) -> dict[str, Any]:
+    """Load launch configuration with the required local dataset catalog."""
+    return load_pretrain_config(
+        config_paths,
+        overrides=overrides,
+        data_catalog_path=DATA_CATALOG_PATH,
+    )
+
+
+def load_data_catalog(path: str | Path) -> dict[str, dict[str, str]]:
+    """Load and validate one local dataset-path catalog."""
+    catalog_path = Path(path)
+    if not catalog_path.is_file():
+        raise ConfigError(
+            "Local dataset catalog does not exist: " f"{catalog_path.resolve()}"
+        )
+    value = _load_data_catalog_mapping(catalog_path)
+    root = _mapping(value, {"datasets"}, "data catalog")
+    datasets = root["datasets"]
+    if not isinstance(datasets, dict) or not datasets:
+        raise ConfigError("data catalog datasets must be a non-empty mapping.")
+    _validate_data_catalog(datasets)
+    return deepcopy(datasets)
+
+
+def selected_data_catalog(
+    config: Mapping[str, Any],
+    include_held_out: bool = False,
+) -> dict[str, dict[str, str]]:
+    """Return selected dataset definitions from a validated catalog."""
+    catalog = config["invocation"]["data_catalog"]
+    selected = config["campaign"]["data"]["included_datasets"]
+    identities = sorted(catalog) if selected == ["*"] else list(selected)
+    if include_held_out:
+        identities.extend(
+            config["invocation"].get("held_out_evaluation_datasets", [])
+        )
+        identities = sorted(set(identities))
+    missing = sorted(set(identities) - set(catalog))
+    if missing:
+        raise ConfigError(f"Data catalog lacks included_datasets: {missing}")
+    return {identity: deepcopy(catalog[identity]) for identity in identities}
+
+
+def _load_data_catalog_mapping(path: Path) -> dict[str, Any]:
+    """Load a catalog while rejecting duplicate YAML mapping keys."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        document = yaml.compose(text, Loader=yaml.SafeLoader)
+        _reject_duplicate_yaml_keys(document)
+        value = yaml.safe_load(text)
+    except yaml.YAMLError as error:
+        raise ConfigError(
+            f"Could not parse data catalog: {path.resolve()}"
+        ) from error
+    if not isinstance(value, dict):
+        raise ConfigError(f"Expected mapping in data catalog: {path.resolve()}")
+    return value
+
+
+def _reject_duplicate_yaml_keys(node: yaml.Node | None) -> None:
+    """Raise when any YAML mapping declares a key more than once."""
+    if node is None:
+        return
+    if isinstance(node, yaml.MappingNode):
+        keys: set[str] = set()
+        for key_node, value_node in node.value:
+            if isinstance(key_node, yaml.ScalarNode):
+                key = key_node.value
+                if key in keys:
+                    raise ConfigError(
+                        "Data catalog contains a duplicate mapping key: "
+                        f"{key!r}."
+                    )
+                keys.add(key)
+            _reject_duplicate_yaml_keys(value_node)
+        return
+    if isinstance(node, yaml.SequenceNode):
+        for item in node.value:
+            _reject_duplicate_yaml_keys(item)
 
 
 def _config_paths(
@@ -128,9 +223,7 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     elif path.suffix.lower() in {".yaml", ".yml"}:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
     else:
-        raise ConfigError(
-            f"Unsupported configuration extension: {path.suffix}"
-        )
+        raise ConfigError(f"Unsupported configuration extension: {path.suffix}")
     if not isinstance(value, dict):
         raise ConfigError(
             f"Expected mapping in configuration: {path.resolve()}"
@@ -138,9 +231,7 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     return value
 
 
-def _merge(
-    base: Mapping[str, Any], local: Mapping[str, Any]
-) -> dict[str, Any]:
+def _merge(base: Mapping[str, Any], local: Mapping[str, Any]) -> dict[str, Any]:
     """Recursively merge one configuration layer over another."""
     merged = deepcopy(dict(base))
     for key, value in local.items():
@@ -231,9 +322,7 @@ def validate_pretrain_config(config: dict[str, Any]) -> None:
     campaign = _mapping(root["campaign"], COMMON_CAMPAIGN, "campaign")
     stage = campaign["stage"]
     if stage not in {"braintokenizer", "brainomni"}:
-        raise ConfigError(
-            "campaign.stage must be braintokenizer or brainomni."
-        )
+        raise ConfigError("campaign.stage must be braintokenizer or brainomni.")
     _integer(campaign["seed"], "campaign.seed", 0)
     _validate_data(campaign["data"])
     _validate_optimizer(campaign["optimizer"], stage)
@@ -257,22 +346,25 @@ def validate_pretrain_config(config: dict[str, Any]) -> None:
     )
     _validate_stage(campaign)
     _validate_invocation(root["invocation"], stage)
+    training_datasets = set(selected_data_catalog(root))
+    held_out = set(root["invocation"]["held_out_evaluation_datasets"])
+    overlap = sorted(training_datasets & held_out)
+    if overlap:
+        raise ConfigError(
+            "Held-out evaluation datasets are included in this campaign: "
+            f"{overlap}. Remove them from campaign.data.included_datasets "
+            "before preprocessing or training."
+        )
 
 
 def _validate_data(data: Any) -> None:
     values = _mapping(data, DATA_KEYS, "campaign.data")
-    if values["signal_type"] not in {"eeg", "meg", "both"}:
-        raise ConfigError(
-            "campaign.data.signal_type must be eeg, meg, or both."
-        )
     datasets = values["included_datasets"]
     if not isinstance(datasets, list) or not datasets:
         raise ConfigError(
             "campaign.data.included_datasets must be a non-empty list."
         )
-    if any(
-        not isinstance(item, str) or not item.strip() for item in datasets
-    ):
+    if any(not isinstance(item, str) or not item.strip() for item in datasets):
         raise ConfigError(
             "campaign.data.included_datasets contains an invalid name."
         )
@@ -372,9 +464,7 @@ def _validate_stage(campaign: dict[str, Any]) -> None:
             _integer(model[key], f"campaign.model.{key}", 1)
         ratios = model["ratios"]
         if not isinstance(ratios, list) or not ratios:
-            raise ConfigError(
-                "campaign.model.ratios must be a non-empty list."
-            )
+            raise ConfigError("campaign.model.ratios must be a non-empty list.")
         for ratio in ratios:
             _integer(ratio, "campaign.model.ratios", 1)
         _fraction(model["dropout"], "campaign.model.dropout")
@@ -415,6 +505,46 @@ def _validate_stage(campaign: dict[str, Any]) -> None:
     )
 
 
+def _validate_data_catalog(catalog: Mapping[str, Any]) -> None:
+    """Validate local paths and declared modalities for all datasets."""
+    if not isinstance(catalog, Mapping):
+        raise ConfigError("data catalog datasets must be a mapping.")
+    if not catalog:
+        raise ConfigError("data catalog datasets must not be empty.")
+    for dataset, definition in catalog.items():
+        if (
+            not isinstance(dataset, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", dataset) is None
+        ):
+            raise ConfigError(
+                "Data catalog dataset IDs must start with a letter or digit "
+                "and contain only letters, digits, periods, underscores, or "
+                f"hyphens; got {dataset!r}. Update "
+                f"{DATA_CATALOG_PATH.resolve()} and retry."
+            )
+        entry = _mapping(definition, {"path", "signal_type"}, dataset)
+        path = entry["path"]
+        if not isinstance(path, str) or not path:
+            raise ConfigError(
+                f"Data catalog {dataset}.path must be non-empty. Update "
+                f"{DATA_CATALOG_PATH.resolve()} and retry."
+            )
+        resolved_path = Path(path).resolve()
+        if not resolved_path.is_dir():
+            raise ConfigError(
+                f"Data catalog path for {dataset} is not a directory: "
+                f"{resolved_path}. Correct the path in "
+                f"{DATA_CATALOG_PATH.resolve()} and retry."
+            )
+        signal_type = entry["signal_type"]
+        if signal_type not in {"eeg", "meg", "both"}:
+            raise ConfigError(
+                f"Data catalog {dataset}.signal_type must be eeg, meg, or "
+                f"both; got {signal_type!r}. Correct it in "
+                f"{DATA_CATALOG_PATH.resolve()} and retry."
+            )
+
+
 def _validate_invocation(invocation: Any, stage: str) -> None:
     keys = set(BASE_INVOCATION)
     if stage == "braintokenizer":
@@ -426,8 +556,8 @@ def _validate_invocation(invocation: Any, stage: str) -> None:
             "expected_tokenizer_weights_sha256",
         }
     values = _mapping(invocation, keys, "invocation")
+    _validate_data_catalog(values["data_catalog"])
     path_keys = {
-        "raw_root",
         "processed_root",
         "metadata_root",
         "output_root",
@@ -449,19 +579,30 @@ def _validate_invocation(invocation: Any, stage: str) -> None:
         "checkpoint_interval_epochs",
     ):
         _integer(values[key], f"invocation.{key}", 1)
-    if (
-        not isinstance(values["evaluation_modes"], list)
-        or not values["evaluation_modes"]
-    ):
+    held_out = values["held_out_evaluation_datasets"]
+    if not isinstance(held_out, list):
         raise ConfigError(
-            "invocation.evaluation_modes must be a non-empty list."
+            "invocation.held_out_evaluation_datasets must be a list."
         )
     if any(
-        not isinstance(mode, str) or not mode.strip()
-        for mode in values["evaluation_modes"]
+        not isinstance(dataset, str) or not dataset.strip()
+        for dataset in held_out
     ):
         raise ConfigError(
-            "invocation.evaluation_modes contains an invalid mode."
+            "invocation.held_out_evaluation_datasets contains an invalid "
+            "dataset ID. Remove empty or non-string values and retry."
+        )
+    if len(set(held_out)) != len(held_out):
+        raise ConfigError(
+            "invocation.held_out_evaluation_datasets must not contain "
+            "duplicates. Remove duplicate dataset IDs and retry."
+        )
+    unknown = sorted(set(held_out) - set(values["data_catalog"]))
+    if unknown:
+        raise ConfigError(
+            "Held-out evaluation datasets are absent from the local data "
+            f"catalog: {unknown}. Add them to "
+            f"{DATA_CATALOG_PATH.resolve()} and retry."
         )
     deep = _mapping(
         values["deepspeed"],
@@ -552,44 +693,47 @@ def _validate_invocation(invocation: Any, stage: str) -> None:
                 )
 
 
-def repository_log_directory(run_directory: str | Path, stage: str) -> Path:
-    """Return the repository-managed text-log directory for one run.
-
-    Parameters
-    ----------
-    run_directory : str or pathlib.Path
-        Run artifact directory with ``<run_name>/exp_<timestamp>`` layout.
-    stage : str
-        Pre-training stage name.
-
-    Returns
-    -------
-    pathlib.Path
-        Directory for rank-zero text logs.
-    """
-    run_path = Path(run_directory)
-    if stage not in {"braintokenizer", "brainomni"}:
-        raise ConfigError(f"Unsupported pre-training log stage: {stage}")
-    return (
-        Path(__file__).resolve().parent / "logs" / stage
-        / run_path.parent.name / run_path.name
-    )
-
-
-def metadata_directory(config: Mapping[str, Any]) -> Path:
-    """Return the metadata directory selected by semantic preprocessing."""
+def preprocessing_directory(config: Mapping[str, Any]) -> Path:
+    """Return the reusable recording cache for preprocessing semantics."""
     pre = config["campaign"]["data"]["preprocessing"]
     name = (
-        f"sfreq_{pre['sample_rate_hz']}_low_{pre['low_frequency_hz']}_high_"
-        f"{pre['high_frequency_hz']}_time_{pre['segment_seconds']}_stride_"
+        f"sfreq_{pre['sample_rate_hz']}_low_"
+        f"{pre['low_frequency_hz']}_high_"
+        f"{pre['high_frequency_hz']}_time_"
+        f"{pre['segment_seconds']}_stride_"
         f"{pre['stride_seconds']}"
     )
     return Path(config["invocation"]["metadata_root"]) / name
 
 
+def metadata_directory(config: Mapping[str, Any]) -> Path:
+    """Return the isolated split directory for training semantics."""
+    catalog = selected_data_catalog(config)
+    split_identity = {
+        "datasets": {
+            dataset: catalog[dataset]["signal_type"]
+            for dataset in sorted(catalog)
+        },
+        "seed": config["campaign"]["seed"],
+        "split_ratios": config["campaign"]["data"]["split_ratios"],
+    }
+    digest = canonical_config_sha256(split_identity)[:12]
+    return preprocessing_directory(config) / f"splits_{digest}"
+
+
+def canonical_config_sha256(value: Any) -> str:
+    """Return a canonical digest for path-free configuration values."""
+    text = json.dumps(
+        value,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
 def resolve_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve the source dataset selection from processed metadata."""
-    info_path = metadata_directory(config) / "info.json"
+    info_path = preprocessing_directory(config) / "info.json"
     if not info_path.is_file():
         raise ConfigError(
             f"Preprocessing metadata does not exist: {info_path.resolve()}"
@@ -612,25 +756,23 @@ def resolve_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
             "Preprocessing metadata has invalid dataset identities: "
             f"{info_path.resolve()}"
         )
-    datasets = sorted(dataset_set)
-    selected = config["campaign"]["data"]["included_datasets"]
-    if selected != ["*"]:
-        unexpected = set(datasets) - set(selected)
-        missing = set(selected) - set(datasets)
-        if unexpected:
-            raise ConfigError(
-                "Preprocessing metadata contains datasets outside "
-                "included_datasets: "
-                f"{sorted(unexpected)}"
-            )
-        if missing:
-            raise ConfigError(
-                "No generated preprocessing metadata exists for "
-                "included_datasets: "
-                f"{sorted(missing)}"
-            )
+    selected = set(selected_data_catalog(config))
+    catalog = set(config["invocation"]["data_catalog"])
+    unexpected = dataset_set - catalog
+    missing = selected - dataset_set
+    if unexpected:
+        raise ConfigError(
+            "Preprocessing metadata contains datasets outside catalog: "
+            f"{sorted(unexpected)}"
+        )
+    if missing:
+        raise ConfigError(
+            "No generated preprocessing metadata exists for catalog datasets: "
+            f"{sorted(missing)}"
+        )
+
     resolved = deepcopy(dict(config))
-    resolved["campaign"]["data"]["included_datasets"] = datasets
+    resolved["campaign"]["data"]["included_datasets"] = sorted(selected)
     return resolved
 
 
@@ -692,53 +834,3 @@ def sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def write_run_artifacts(
-    run_directory: str | Path,
-    config: Mapping[str, Any],
-    model_config: Mapping[str, Any],
-    tokenizer_identity: Mapping[str, str] | None = None,
-) -> None:
-    """Write atomic resolved sidecars for a newly created run."""
-    directory = Path(run_directory)
-    datasets = config["campaign"]["data"]["included_datasets"]
-    if not isinstance(datasets, list) or not datasets:
-        raise ConfigError(
-            "Run artifacts require resolved non-empty "
-            "campaign.data.included_datasets."
-        )
-    directory.mkdir(parents=True, exist_ok=True)
-    model_path = directory / "model_cfg.json"
-    _write_json(model_path, model_config)
-    setting = {
-        "schema_version": config["schema_version"],
-        "campaign": deepcopy(config["campaign"]),
-    }
-    setting["campaign"].pop("model")
-    setting_path = directory / "pretrain_setting.yaml"
-    _write_yaml(setting_path, setting)
-    manifest: dict[str, Any] = {
-        "schema_version": config["schema_version"],
-        "stage": config["campaign"]["stage"],
-        "model_config_sha256": sha256_file(model_path),
-        "pretrain_setting_sha256": sha256_file(setting_path),
-    }
-    if tokenizer_identity is not None:
-        manifest["tokenizer_identity"] = dict(tokenizer_identity)
-    _write_json(directory / "pretrain_setting.json", manifest)
-    _write_yaml(directory / "invocation.yaml", config["invocation"])
-
-
-def _write_json(path: Path, value: Mapping[str, Any]) -> None:
-    _atomic_write(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
-
-
-def _write_yaml(path: Path, value: Mapping[str, Any]) -> None:
-    _atomic_write(path, yaml.safe_dump(dict(value), sort_keys=False))
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)

@@ -214,9 +214,11 @@ train_omni_results/
 train_tokenizer_results/
 ckpt_collection/
 data/
+!configs/data/
+!configs/data/datasets.yaml
 
-# Machine-local pre-training overrides
-configs/pretrain/*.local.yaml
-configs/pretrain/*.local.yml
-docs/*.local.md
+# Machine-local configurations and logs
+*.local.yaml
+*.local.yml
+*.local.md
 logs/

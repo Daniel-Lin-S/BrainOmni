@@ -16,7 +16,6 @@ class BrainTokenizerTrainerConfig:
         model = campaign["model"]
         optimizer = campaign["optimizer"]
         self.settings = settings
-        self.signal_type = campaign["data"]["signal_type"]
         self.exp_name = invocation["run_name"]
         self.pretrain_metadata_path = str(metadata_directory(settings))
         self.window_length = model["window_length"]
@@ -43,12 +42,22 @@ class BrainTokenizerTrainerConfig:
         self.codebook_lr = optimizer["codebook_lr"]
         self.weight_decay = optimizer["weight_decay"]
         self.scheduler_warm_ratio = campaign["scheduler"]["warmup_ratio"]
-        self.ds_config, self.gradient_accumulation_steps = build_deepspeed_config(
-            settings, world_size
+        self.ds_config, self.gradient_accumulation_steps = (
+            build_deepspeed_config(settings, world_size)
         )
-        self.evaluation_modes = invocation["evaluation_modes"]
-        self.checkpoint_interval_epochs = invocation["checkpoint_interval_epochs"]
-        self.visualization_interval_steps = invocation["visualization_interval_steps"]
+        self.evaluation_datasets = [
+            "test",
+            *invocation["held_out_evaluation_datasets"],
+        ]
+        self.held_out_evaluation_datasets = invocation[
+            "held_out_evaluation_datasets"
+        ]
+        self.checkpoint_interval_epochs = invocation[
+            "checkpoint_interval_epochs"
+        ]
+        self.visualization_interval_steps = invocation[
+            "visualization_interval_steps"
+        ]
 
     def get_model_cfg(self) -> dict[str, Any]:
         """Return the unchanged portable model constructor configuration."""

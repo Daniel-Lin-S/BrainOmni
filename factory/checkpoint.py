@@ -1,26 +1,56 @@
-"""DeepSpeed checkpoint conversion used by completed pre-training runs."""
+"""Convert completed DeepSpeed checkpoints into portable model weights."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from factory.campaign import portable_weight_name
 
-def convert_best_checkpoint(run_directory: str | Path) -> Path:
-    """Convert the best DeepSpeed checkpoint to portable tokenizer weights.
 
-    Returns the generated ``BrainTokenizer.pt`` file.
+def convert_best_checkpoint(
+    campaign_directory: str | Path,
+    stage: str = "braintokenizer",
+    output_path: str | Path | None = None,
+    allow_existing: bool = False,
+) -> Path:
+    """Convert a campaign's best ZeRO checkpoint to a portable state file.
+
+    Parameters
+    ----------
+    campaign_directory : str or pathlib.Path
+        Campaign root containing ``checkpoint/best``.
+    stage : {"braintokenizer", "brainomni"}, optional
+        Stage controlling the default output filename. Default is
+        ``"braintokenizer"`` for backward compatibility.
+    output_path : str or pathlib.Path, optional
+        Exact output file. By default, the stage portable filename is written
+        below ``campaign_directory``.
+    allow_existing : bool, optional
+        Whether an existing output may be replaced by DeepSpeed. Default is
+        ``False``.
+
+    Returns
+    -------
+    pathlib.Path
+        Generated portable state-dictionary path.
     """
-    run_path = Path(run_directory)
-    checkpoint_path = run_path / "checkpoint" / "best"
-    if not checkpoint_path.is_dir():
+    campaign_root = Path(campaign_directory).resolve()
+    best_path = campaign_root / "checkpoint" / "best"
+    if not best_path.is_dir():
         raise FileNotFoundError(
             "Best DeepSpeed checkpoint does not exist: "
-            f"{checkpoint_path.resolve()}"
+            f"{best_path.resolve()}. Complete at least one validation epoch "
+            "before exporting portable weights."
         )
-    output_path = run_path / "BrainTokenizer.pt"
-    if output_path.exists():
+    destination = (
+        Path(output_path).resolve()
+        if output_path is not None
+        else campaign_root / portable_weight_name(stage)
+    )
+    if destination.exists() and not allow_existing:
         raise FileExistsError(
-            f"Refusing to overwrite tokenizer weights: {output_path.resolve()}"
+            f"Refusing to overwrite portable weights: {destination}. "
+            "Use campaign health repair for a verified atomic replacement."
         )
     try:
         from deepspeed.utils.zero_to_fp32 import (
@@ -28,16 +58,18 @@ def convert_best_checkpoint(run_directory: str | Path) -> Path:
         )
     except ImportError as error:
         raise RuntimeError(
-            "DeepSpeed checkpoint conversion is unavailable."
+            "DeepSpeed checkpoint conversion is unavailable. Install the "
+            "training environment, then rerun campaign repair."
         ) from error
+    destination.parent.mkdir(parents=True, exist_ok=True)
     convert_zero_checkpoint_to_fp32_state_dict(
-        str(run_path / "checkpoint"),
-        str(output_path),
+        str(campaign_root / "checkpoint"),
+        str(destination),
         tag="best",
     )
-    if not output_path.is_file() or output_path.stat().st_size == 0:
+    if not destination.is_file() or destination.stat().st_size == 0:
         raise RuntimeError(
-            "Checkpoint conversion produced no weights: "
-            f"{output_path.resolve()}"
+            "Checkpoint conversion produced no portable weights: "
+            f"{destination}. Inspect checkpoint/best and rerun repair."
         )
-    return output_path
+    return destination

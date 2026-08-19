@@ -1,10 +1,12 @@
 import os
 import mne
 import time
+from pathlib import Path
 import random
+from typing import Any
 import numpy as np
 import torch
-from constant import SAMPLE_RATE, LOW, HIGH, NEW_DEVICE_DATASET_LIST
+from constant import SAMPLE_RATE, LOW, HIGH
 from factory.brain_constant import (
     EXCLUDE_DICT,
     RENAME_DICT,
@@ -19,7 +21,7 @@ from accessor import DataAccessor, write_torch_warpper
 def filter_channel(raw, dataset: str):
     exclude = []
     if dataset in EXCLUDE_DICT.keys():
-        exclude = EXCLUDE_DICT[dataset]
+        exclude = list(EXCLUDE_DICT[dataset])
 
     for i in ["HEO", "VEO", "EKG", "EMG"]:
         if i in raw.info.ch_names and i not in exclude:
@@ -37,6 +39,46 @@ def filter_channel(raw, dataset: str):
     return raw
 
 
+def infer_signal_type(raw: Any, dataset: str) -> str:
+    """Return the retained EEG/MEG modality for one raw recording.
+
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Recording whose channels are selected in place.
+    dataset : str
+        Dataset ID used by the shared channel-selection policy.
+
+    Returns
+    -------
+    str
+        ``"eeg"``, ``"meg"``, or ``"both"``.
+
+    Raises
+    ------
+    ValueError
+        Raised when channel selection retains neither EEG nor MEG channels.
+    """
+    filtered = filter_channel(raw, dataset)
+    eeg_indices = mne.pick_types(filtered.info, eeg=True)
+    meg_indices = mne.pick_types(
+        filtered.info,
+        meg=True,
+        ref_meg=False,
+    )
+    has_eeg = bool(eeg_indices.size)
+    has_meg = bool(meg_indices.size)
+    if has_eeg and has_meg:
+        return "both"
+    if has_eeg:
+        return "eeg"
+    if has_meg:
+        return "meg"
+    raise ValueError(
+        f"No EEG or MEG channels remain after filtering dataset {dataset}."
+    )
+
+
 def rename_channel(raw, dataset: str):
     if dataset in RENAME_DICT.keys():
         raw.rename_channels(RENAME_DICT[dataset])
@@ -44,7 +86,10 @@ def rename_channel(raw, dataset: str):
 
 
 def set_montage(raw, dataset: str):
-    if dataset not in MONTAGE_DICT.keys() and dataset not in CUSTOM_MONTAGE_DICT.keys():
+    if (
+        dataset not in MONTAGE_DICT.keys()
+        and dataset not in CUSTOM_MONTAGE_DICT.keys()
+    ):
         return raw
     if dataset in CUSTOM_MONTAGE_DICT.keys():
         montage = mne.channels.read_custom_montage(CUSTOM_MONTAGE_DICT[dataset])
@@ -109,12 +154,16 @@ def get_sensor_type_mask(sensor_type: np.ndarray):
 
 
 def _auto_detect_bad_channels(raw_data: mne.io.Raw, threshold: int = 10):
-    spectrum = raw_data.compute_psd(tmax=1000000, average="mean", verbose=False)  # fmax
+    spectrum = raw_data.compute_psd(
+        tmax=1000000, average="mean", verbose=False
+    )  # fmax
     data = spectrum.data + 1e-16
     ch_names = np.array(spectrum.ch_names)
     log_data = np.log(data)
     # Euclidean distance between channel pairs
-    distances = np.linalg.norm(log_data[:, None, :] - log_data[None, :, :], axis=2)
+    distances = np.linalg.norm(
+        log_data[:, None, :] - log_data[None, :, :], axis=2
+    )
     mean_distances = np.mean(distances, axis=1)
 
     # Use IQR (interquartile range) to identify outliers
@@ -177,9 +226,13 @@ def sensortype_wise_normalize(_data: np.ndarray, eeg_mask, mag_mask, grad_mask):
     data = _data.copy()
     if eeg_mask.any():
         eeg_data = data[eeg_mask, :]
-        eeg_mean = np.mean(eeg_data, axis=0, keepdims=True) # reset virtual reference
+        eeg_mean = np.mean(
+            eeg_data, axis=0, keepdims=True
+        )  # reset virtual reference
         eeg_data = eeg_data - eeg_mean
-        eeg_std = np.std(eeg_data) + 1.0e-5 # scale as a group,perserve the magnitude relationship between eeg channels 
+        eeg_std = (
+            np.std(eeg_data) + 1.0e-5
+        )  # Preserve group magnitude relationships.
         data[eeg_mask, :] = eeg_data / (eeg_std)
 
     if mag_mask.any():
@@ -215,7 +268,9 @@ def split_to_segments_save(
     meg_mask: np.ndarray,
     path: str,
     dataset: str,
+    dataset_root: str,
     ready_path: str,
+    signal_type: str,
     sample_rate_hz: float,
     TIME: int,
     STRIDE: int,
@@ -224,11 +279,17 @@ def split_to_segments_save(
     start = 0
     end = int(start + TIME * sample_rate_hz)
     stride_length = int(STRIDE * sample_rate_hz)
-    dataset_name = accessor.get_dataset_folder_name(path)
-    dataset_to_file_path = f"{dataset_name}/" + path.split(f"/{dataset_name}/")[-1]
-    brain_file_folder_path = os.path.join(ready_path, dataset_to_file_path).rsplit(
-        ".", 1
-    )[0]
+    root_path = Path(dataset_root).resolve()
+    raw_path = Path(path).resolve()
+    try:
+        relative_path = raw_path.relative_to(root_path)
+    except ValueError as error:
+        raise ValueError(
+            f"Recording {raw_path} is outside configured root {root_path}."
+        ) from error
+    brain_file_folder_path = str(
+        Path(ready_path) / dataset / relative_path.with_suffix("")
+    )
     accessor.mkdir(brain_file_folder_path)
 
     while end < data.shape[1]:
@@ -250,6 +311,7 @@ def split_to_segments_save(
                 "dataset": dataset,
                 "path": seg_data_path,
                 "channels": seg_data.shape[0],
+                "signal_type": signal_type,
                 "is_eeg": bool((sensor_type == SENSOR_TYPE_DICT["EEG"]).all()),
                 "is_meg": bool(
                     (
@@ -264,11 +326,31 @@ def split_to_segments_save(
     return segments_metadata
 
 
-def split_pretrain_metadata(data, split_ratios: dict[str, float]):
-    new_device_dataset_dict = {}
-    for dataset in NEW_DEVICE_DATASET_LIST:
-        new_device_dataset_dict[dataset] = [i for i in data if i["dataset"] == dataset]
-    data = [i for i in data if i["dataset"] not in NEW_DEVICE_DATASET_LIST]
+def split_pretrain_metadata(
+    data: list[dict[str, Any]],
+    split_ratios: dict[str, float],
+    training_datasets: list[str],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+]:
+    """Split training metadata while isolating requested held-out datasets."""
+    training_names = set(training_datasets)
+    observed_names = {item["dataset"] for item in data}
+    held_out_names = observed_names - training_names
+    held_out = {
+        dataset: [item for item in data if item["dataset"] == dataset]
+        for dataset in sorted(held_out_names)
+    }
+    data = [item for item in data if item["dataset"] in training_names]
+    if not data:
+        raise ValueError(
+            "No metadata remains for train, validation, and test splits after "
+            "held-out datasets were removed. Include at least one training "
+            "dataset and rerun preprocessing."
+        )
     random.shuffle(data)
     N = len(data)
     train_end = int(N * split_ratios["train"])
@@ -276,7 +358,7 @@ def split_pretrain_metadata(data, split_ratios: dict[str, float]):
     train = data[:train_end]
     val = data[train_end:validation_end]
     test = data[validation_end:]
-    return train, val, test, new_device_dataset_dict
+    return train, val, test, held_out
 
 
 def process(
@@ -286,6 +368,8 @@ def process(
     low_frequency_hz: float,
     high_frequency_hz: float,
     dataset: str,
+    dataset_root: str,
+    signal_type: str,
     ready_path: str,
     TIME: int,
     STRIDE: int,
@@ -328,9 +412,11 @@ def process(
         meg_mask,
         path,
         dataset,
+        dataset_root,
         ready_path,
+        signal_type,
+        sample_rate_hz,
         TIME,
         STRIDE,
-        sample_rate_hz,
     )
     return segments_metadata, path

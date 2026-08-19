@@ -1,11 +1,9 @@
-"""Launch configurable BrainTokenizer pre-training."""
+"""Launch one exact-semantic BrainTokenizer pre-training campaign."""
 
 from __future__ import annotations
 
 import argparse
 import os
-from datetime import datetime
-from pathlib import Path
 import random
 
 import numpy as np
@@ -13,17 +11,20 @@ import torch
 
 from braintokenizer.config import BrainTokenizerTrainerConfig
 from braintokenizer.trainer import Trainer
-from pretrain_config import (
-    load_pretrain_config,
-    resolve_dataset_identities,
-    write_run_artifacts,
+from factory.campaign import (
+    ensure_training_campaign,
+    prepare_campaign,
+    relocate_terminal_log,
+    update_attempt_status,
 )
-
-DEFAULT_CONFIG = "configs/pretrain/braintokenizer.yaml"
+from pretrain_config import (
+    load_pretrain_launch_config,
+    resolve_dataset_identities,
+)
 
 
 def seed_everything(seed: int) -> None:
-    """Seed all supported random number generators for a campaign."""
+    """Seed all supported random-number generators for a campaign."""
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -39,48 +40,55 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--launcher", type=str)
-    parser.add_argument("--config", nargs="+", default=[DEFAULT_CONFIG])
-    parser.add_argument("--set", dest="overrides", action="append", default=[])
+    parser.add_argument("--config", nargs="+", required=True)
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+    )
     return parser.parse_args()
 
 
-def create_run_directory(
-    rank: int,
-    config: dict[str, object],
-    model_config: dict[str, object],
-) -> str:
-    """Create a run directory and write configuration artifacts on rank zero."""
-    invocation = config["invocation"]
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_path = Path(invocation["output_root"]) / invocation["run_name"]
-    run_path = run_path / f"exp_{timestamp}"
-    if rank == 0:
-        write_run_artifacts(run_path, config, model_config)
-    return str(run_path)
-
-
 def main() -> None:
-    """Resolve settings and start distributed BrainTokenizer training."""
+    """Resolve settings and start or resume BrainTokenizer training."""
     args = parse_args()
-    config = load_pretrain_config(args.config, overrides=args.overrides)
+    config = load_pretrain_launch_config(args.config, args.overrides)
     config = resolve_dataset_identities(config)
     seed_everything(config["campaign"]["seed"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     trainer_config = BrainTokenizerTrainerConfig(config, world_size)
-    run_path = create_run_directory(
-        rank,
+    context = prepare_campaign(
         config,
         trainer_config.get_model_cfg(),
+        config_paths=args.config,
+        overrides=args.overrides,
+        world_size=world_size,
+        rank=rank,
     )
-    Trainer(
-        trainer_config,
-        local_rank,
-        rank,
-        world_size,
-        exp_path=run_path,
-    ).main()
+    if rank == 0:
+        relocated = relocate_terminal_log(context)
+        if relocated is not None:
+            print(f"Terminal log: {relocated.resolve()}")
+    training_required = ensure_training_campaign(context, rank=rank)
+    try:
+        Trainer(
+            trainer_config,
+            local_rank,
+            rank,
+            world_size,
+            campaign=context,
+            training_required=training_required,
+        ).main()
+    except Exception as error:
+        if rank == 0:
+            update_attempt_status(context, "failed", error)
+        raise
+    else:
+        if rank == 0:
+            update_attempt_status(context, "complete")
 
 
 if __name__ == "__main__":

@@ -20,7 +20,8 @@ STANDARD_1020 = [
     "TPP10h","Fp1-F7","F7-T7","T7-P7","P7-O1","Fp2-F8","F8-T8","T8-P8","P8-O2","Fp1-F3","F3-C3","C3-P3",
     "P3-O1","Fp2-F4","F4-C4","C4-P4","P4-O2",
 ]
-# eeg:5697       meg: 5261
+# eeg:ds005697       meg: ds005261
+# montages unseen by BrainOmni pretraining. 
 NEW_DEVICE_DATASET_LIST = ["ds005261-1.0.0", "ds005697-1.0.2"]
 
 PROJECT_ROOT_PATH = "./"  # must end with /

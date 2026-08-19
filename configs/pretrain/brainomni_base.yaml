@@ -3,7 +3,6 @@ campaign:
   stage: brainomni
   seed: 42
   data:
-    signal_type: both
     included_datasets: ["*"]
     split_ratios:
       train: 0.85
@@ -37,7 +36,6 @@ campaign:
     epochs: 32
     global_batch_size: 256
 invocation:
-  raw_root: null
   processed_root: null
   metadata_root: null
   output_root: null
@@ -48,7 +46,7 @@ invocation:
   batch_size_per_gpu: 8
   num_workers: 32
   preprocess_workers: 32
-  evaluation_modes: [test, ds005261-1.0.0, ds005697-1.0.2]
+  held_out_evaluation_datasets: []
   checkpoint_interval_epochs: 20
   deepspeed:
     bf16:

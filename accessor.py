@@ -4,9 +4,9 @@ import mne
 import json
 import torch
 from pathlib import Path
+from typing import Any
 from constant import DATA_ROOT_PATH
 from tqdm import tqdm
-BRAIN_EXTENSION = ["con", "fif", "set", "bdf", "edf", "vhdr", "ds"]
 
 
 def is_useful_path(x):
@@ -44,6 +44,7 @@ class DataAccessor:
     """
     Load processed tensor files.
     """
+
     def __init__(self, read_only: bool = True):
         self.read_only = read_only
         self.brain_read_func_dict = {
@@ -58,31 +59,55 @@ class DataAccessor:
             "gdf": mne.io.read_raw_gdf,
         }
 
-    def search_brain_files(self, root_path: str):
-        brain_files = []
+    def search_brain_files(
+        self,
+        root_path: str,
+        dataset: str,
+    ) -> list[dict[str, str]]:
+        """Find supported MNE recordings under one catalog dataset root.
+
+        Parameters
+        ----------
+        root_path : str
+            Absolute dataset root from the local data catalog.
+        dataset : str
+            Catalog dataset ID assigned to every discovered recording.
+
+        Returns
+        -------
+        list of dict of str to str
+            Recording mappings with ``path`` and catalog ``dataset`` fields.
+        """
+        brain_files: list[dict[str, str]] = []
         for root, dir, name in tqdm(os.walk(root_path)):
             if len(name) > 0:
                 for i in name:
-                    if i.split(".")[-1] in BRAIN_EXTENSION and is_useful_path(i):
+                    extension = i.rsplit(".", 1)[-1].lower()
+                    if (
+                        extension in self.brain_read_func_dict
+                        and is_useful_path(i)
+                    ):
                         brain_files.append(
                             {
                                 "path": os.path.join(root, i),
-                                "dataset": self.get_dataset_folder_name(root),
+                                "dataset": dataset,
                             }
                         )
             if len(dir) > 0:
                 for i in dir:
-                    if i.split(".")[-1] == "ds" and is_useful_path(i):
+                    extension = i.rsplit(".", 1)[-1].lower()
+                    if extension == "ds" and is_useful_path(i):
                         brain_files.append(
                             {
                                 "path": os.path.join(root, i),
-                                "dataset": self.get_dataset_folder_name(root),
+                                "dataset": dataset,
                             }
                         )
         return brain_files
 
-    def read_brain_file(self, path: str, preload: bool = True):
-        extension = path.rsplit(".")[-1]
+    def read_brain_file(self, path: str, preload: bool = True) -> Any:
+        """Read one supported MNE recording using its filename extension."""
+        extension = path.rsplit(".", 1)[-1].lower()
         return self.brain_read_func_dict[extension](
             path, verbose=False, preload=preload
         )
@@ -98,7 +123,9 @@ class DataAccessor:
         return path.replace(DATA_ROOT_PATH, "").split("/")[1]
 
     def replace_usage_folder_name(self, path: str, new_usage: str):
-        return path.replace(f"/{self.get_usage_folder_name(path)}/", f"/{new_usage}/")
+        return path.replace(
+            f"/{self.get_usage_folder_name(path)}/", f"/{new_usage}/"
+        )
 
     def mkdir(self, path: str):
         os.makedirs(path, exist_ok=True)

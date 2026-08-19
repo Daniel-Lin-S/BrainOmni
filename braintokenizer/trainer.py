@@ -1,6 +1,6 @@
+from pathlib import Path
 import os
 import math
-import json
 import torch
 import logging
 import deepspeed
@@ -11,11 +11,25 @@ from einops import rearrange
 from torch.utils.tensorboard import SummaryWriter
 from accessor import DataAccessor
 from pretrain_dataset import build_brain_bucket_dataloader
-from factory.checkpoint import convert_best_checkpoint
+from factory.campaign import (
+    CampaignContext,
+    export_completed_weights,
+    repository_attempt_log_directory,
+    validate_checkpoint,
+)
+from factory.training_runtime import (
+    evaluation_metadata_available,
+    evaluation_metadata_path,
+    existing_evaluation_matches,
+    load_completed_portable,
+    resume_distributed_checkpoint,
+    save_distributed_checkpoint,
+    write_evaluation_metrics,
+)
 from braintokenizer.config import BrainTokenizerTrainerConfig
 from braintokenizer.model import BrainTokenizer
 from braintokenizer.metrics import MetricsComputer
-from pretrain_config import repository_log_directory
+
 
 def batched_bincount(x, num_classes, dim):
     target = torch.zeros(
@@ -49,15 +63,18 @@ class Trainer:
         local_rank: int,
         rank: int,
         world_size: int,
-        exp_path: str,
+        campaign: CampaignContext,
+        training_required: bool,
     ):
         # prepare basic environment
         self.cfg = cfg
         self.local_rank = local_rank
         self.rank = rank
         self.world_size = world_size
-        self.exp_path = exp_path
-        self.ckpt_path = os.path.join(self.exp_path, "checkpoint")
+        self.campaign = campaign
+        self.training_required = training_required
+        self.exp_path = str(campaign.root)
+        self.ckpt_path = str(campaign.checkpoint_root)
         os.makedirs(self.ckpt_path, exist_ok=True)
         self.accessor = DataAccessor(read_only=True)
 
@@ -98,44 +115,142 @@ class Trainer:
             train_total_steps * self.cfg.scheduler_warm_ratio
         )
         self.model = self.deepspeed_initialize()
+        if self.training_required:
+            restored = resume_distributed_checkpoint(
+                self.model,
+                self.campaign,
+            )
+            if restored is not None:
+                (
+                    self.epoch,
+                    self.best_eval_loss,
+                    self.train_step_counter,
+                ) = restored
+                self.logger.info(
+                    "Resumed exact campaign at epoch %s from %s.",
+                    self.epoch,
+                    (self.campaign.checkpoint_root / "latest").resolve(),
+                )
 
     def main(self):
+        """Train or reuse the exact campaign, export, and evaluate."""
+        if self.training_required:
+            self._train_epochs()
+            self._load_best_checkpoint()
+            self._export_completed_checkpoint()
+        else:
+            load_completed_portable(self.model, self.campaign)
+        self.model.eval()
+        del self.train_loader
+        del self.val_loader
+        self._evaluate_requested_datasets()
+        self.writer.close()
+        dist.destroy_process_group()
+
+    def _train_epochs(self):
         self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
         while self.epoch < self.total_epoch:
             self.count_epoch()
             self.before_epoch()
             self.model.train()
+            loader = self.train_loader
             if self.rank == 0:
-                with tqdm(self.train_loader, unit="batch") as tepoch:
-                    for self.input_dict in tepoch:
-                        tepoch.set_description(f"Epoch {self.epoch}")
-                        tepoch.set_postfix(self.train_step())
-            else:
-                for self.input_dict in self.train_loader:
+                loader = tqdm(loader, unit="batch")
+            for self.input_dict in loader:
+                if self.rank == 0:
+                    loader.set_description(f"Epoch {self.epoch}")
+                    loader.set_postfix(self.train_step())
+                else:
                     self.train_step()
             self.model.eval()
+            loader = self.val_loader
             if self.rank == 0:
-                with tqdm(self.val_loader, unit="batch") as tepoch:
-                    for self.input_dict in tepoch:
-                        tepoch.set_description(f"Epoch {self.epoch}")
-                        tepoch.set_postfix(self.eval_step())
-            else:
-                for self.input_dict in self.val_loader:
+                loader = tqdm(loader, unit="batch")
+            for self.input_dict in loader:
+                if self.rank == 0:
+                    loader.set_description(f"Epoch {self.epoch}")
+                    loader.set_postfix(self.eval_step())
+                else:
                     self.eval_step()
             self.after_epoch()
         self.logger.info(">>>>>>>>>>>>>>>> Finish Training >>>>>>>>>>>>>>>>")
-        self.load_ckpt(
-            load_dir=os.path.join(self.exp_path, "checkpoint"), tag="best"
-        )
-        self.model.eval()
-        del self.train_loader
-        del self.val_loader
 
+    def _load_best_checkpoint(self):
+        validate_checkpoint(self.campaign.root, "best")
+        load_path, _ = self.model.load_checkpoint(
+            load_dir=self.ckpt_path,
+            tag="best",
+        )
+        if load_path is None:
+            raise RuntimeError(
+                "DeepSpeed could not load the verified best checkpoint at "
+                f"{(self.campaign.checkpoint_root / 'best').resolve()}."
+            )
+
+    def _export_completed_checkpoint(self):
+        dist.barrier()
+        failed = torch.zeros(
+            (1,),
+            device=self.local_rank,
+            dtype=torch.int32,
+        )
+        if self.rank == 0:
+            try:
+                health = export_completed_weights(
+                    self.campaign,
+                    expected_state=self.model.module.state_dict(),
+                )
+            except Exception as error:
+                failed.fill_(1)
+                self.logger.info(
+                    "Failed to export verified BrainTokenizer weights: %s",
+                    error,
+                )
+            else:
+                self.logger.info(
+                    "Verified portable BrainTokenizer weights: %s",
+                    health.portable_path,
+                )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if failed.item():
+            raise RuntimeError(
+                "Rank zero could not export and validate BrainTokenizer.pt."
+            )
+        dist.barrier()
+
+    def _evaluate_requested_datasets(self):
         self.logger.info("=> Start Testing ...")
-        for mode in self.cfg.evaluation_modes:
+        evaluator_path = Path(__file__).resolve()
+        for mode in self.cfg.evaluation_datasets:
+            if not evaluation_metadata_available(
+                self.campaign,
+                self.cfg.pretrain_metadata_path,
+                mode,
+                self.rank,
+            ):
+                dist.barrier()
+                continue
+            metadata_path = evaluation_metadata_path(
+                self.cfg.pretrain_metadata_path,
+                mode,
+            )
+            if existing_evaluation_matches(
+                self.campaign,
+                mode,
+                evaluator_path,
+                metadata_path,
+            ):
+                self.logger.info("Verified existing evaluation for %s.", mode)
+                dist.barrier()
+                continue
             self.test_loader = self.build_dataloader(mode=mode, ratio=1.0)
+            if len(self.test_loader) == 0:
+                raise RuntimeError(
+                    f"Evaluation loader for {mode!r} is empty despite "
+                    "non-empty metadata. Check distributed batch sizing."
+                )
             self.metrics_computer = MetricsComputer()
-            for i, self.input_dict in enumerate(self.test_loader):
+            for index, self.input_dict in enumerate(self.test_loader):
                 input_dict = self.fetch_input_dict()
                 output_dict = self.model.visualize(**input_dict)
                 self.metrics_computer.step(
@@ -143,55 +258,29 @@ class Trainer:
                     output_dict["x"],
                     output_dict["sensor_type"],
                 )
-                if i % 10 == 0:
+                if index % 10 == 0:
                     self.write_visualize_result(
                         output_dict["x"],
                         output_dict["x_rec"],
                         tag=mode,
-                        global_step=i,
+                        global_step=index,
                     )
             metrics = self.metrics_computer.get_metrics()
-            for type in metrics.keys():
-                for key in metrics[type].keys():
-                    metrics[type][key] = self.scalar_comm_reduce(
-                        metrics[type][key]
+            for metric_group in metrics.values():
+                for key in metric_group:
+                    metric_group[key] = self.scalar_comm_reduce(
+                        metric_group[key]
                     )
-            with open(
-                os.path.join(self.exp_path, f"{mode}_metrics.json"), "w"
-            ) as f:
-                json.dump(metrics, f, indent=4)
-        self.writer.close()
-        self.export_best_checkpoint()
-        dist.destroy_process_group()
-
-    def export_best_checkpoint(self) -> None:
-        """Export the rank-zero best checkpoint without blocking peer ranks."""
-        dist.barrier()
-        conversion_failed = torch.zeros(
-            (1,),
-            device=self.local_rank,
-            dtype=torch.int32,
-        )
-        if self.rank == 0:
-            try:
-                output_path = convert_best_checkpoint(self.exp_path)
-            except Exception as error:
-                conversion_failed.fill_(1)
-                self.logger.info(
-                    "Failed to export the best tokenizer checkpoint: %s",
-                    error,
+            if self.rank == 0:
+                path = write_evaluation_metrics(
+                    self.campaign,
+                    mode,
+                    metrics,
+                    evaluator_path,
+                    metadata_path,
                 )
-            else:
-                self.logger.info(
-                    "Exported the best tokenizer checkpoint to %s.",
-                    output_path,
-                )
-        dist.all_reduce(conversion_failed, op=dist.ReduceOp.MAX)
-        if conversion_failed.item():
-            raise RuntimeError(
-                "Rank zero could not export the best BrainTokenizer checkpoint."
-            )
-        dist.barrier()
+                self.logger.info("Saved evaluation metrics to %s.", path)
+            dist.barrier()
 
     def count_epoch(self):
         self.epoch += 1
@@ -266,10 +355,7 @@ class Trainer:
         loss = output_dict["loss"]
         self.model.backward(loss)
         self.model.step()
-        if (
-            self.train_step_counter % self.cfg.visualization_interval_steps
-            == 0
-        ):
+        if self.train_step_counter % self.cfg.visualization_interval_steps == 0:
             self.model.eval()
             output_dict = self.model.visualize(**input_dict)
             self.write_visualize_result(
@@ -362,31 +448,23 @@ class Trainer:
         )
         self.logger.info("")
 
-        if self.epoch % self.cfg.checkpoint_interval_epochs == 0:
-            self.save_ckpt(tag=f"epoch_{self.epoch}")
-
         if self.eval_running_dict["judge_loss"] < self.best_eval_loss:
             self.best_eval_loss = self.eval_running_dict["judge_loss"]
             self.save_ckpt(tag="best")
+        if self.epoch % self.cfg.checkpoint_interval_epochs == 0:
+            self.save_ckpt(tag=f"epoch_{self.epoch}")
+        self.save_ckpt(tag="latest")
 
     def save_ckpt(self, tag: str):
-        """
-        epoch
-        best_eval_loss
-        save summary writter
-        save logger
-        ckpt
-        optimizer
-        scheduler
-        """
-        self.model.save_checkpoint(
-            save_dir=self.ckpt_path,
-            tag=tag,
-        )
-
-    def load_ckpt(self, load_dir: str, tag: str):
-        load_path, client_state = self.model.load_checkpoint(
-            load_dir=load_dir, tag=tag
+        """Save one manifested collective checkpoint with recovery state."""
+        save_distributed_checkpoint(
+            self.model,
+            self.campaign,
+            tag,
+            self.epoch,
+            self.best_eval_loss,
+            self.train_step_counter,
+            self.rank,
         )
 
     def deepspeed_initialize(self):
@@ -412,8 +490,12 @@ class Trainer:
     def build_writer(self):
         if self.rank != 0:
             return EmptyWriter()
-        writer = SummaryWriter(self.exp_path)
-        self.logger.info(f"Tensorboard writer logging dir: {self.exp_path}")
+        writer_path = self.campaign.attempt_root / "tensorboard"
+        writer = SummaryWriter(writer_path)
+        self.logger.info(
+            "TensorBoard writer logging directory: %s",
+            writer_path.resolve(),
+        )
         return writer
 
     def build_dataloader(self, mode, ratio, persistent_workers=False):
@@ -422,7 +504,6 @@ class Trainer:
             ratio=ratio,
             metadata_path=self.cfg.pretrain_metadata_path,
             accessor=self.accessor,
-            signal_type=self.cfg.signal_type,
             rank=self.rank,
             world_size=self.world_size,
             batch_size=self.cfg.batch_size,
@@ -440,10 +521,7 @@ class Trainer:
             "%H:%M:%S",
         )
 
-        log_directory = repository_log_directory(
-            self.exp_path,
-            "braintokenizer",
-        )
+        log_directory = repository_attempt_log_directory(self.campaign)
         log_directory.mkdir(parents=True, exist_ok=True)
         fileHandler = logging.FileHandler(
             log_directory / "logs.txt",

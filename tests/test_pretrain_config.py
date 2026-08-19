@@ -15,16 +15,21 @@ import yaml
 
 from brainomni.config import BrainOmniTrainerConfig
 from factory.checkpoint import convert_best_checkpoint
+from factory.campaign import CampaignHealth
 from factory.export_pretrained import export_checkpoint
+from factory.process import discover_catalog_recordings
+from factory.utils import split_pretrain_metadata
 from pretrain_config import (
     ConfigError,
     build_deepspeed_config,
+    load_data_catalog,
     load_pretrain_config,
+    load_pretrain_launch_config,
     metadata_directory,
+    preprocessing_directory,
     resolve_dataset_identities,
-    repository_log_directory,
+    selected_data_catalog,
     validate_pretrain_config,
-    write_run_artifacts,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,10 +37,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def write_local_overlay(directory: Path, stage: str) -> Path:
     """Create a disposable local overlay without machine-specific paths."""
+    (directory / "raw").mkdir(parents=True, exist_ok=True)
     invocation = {
-        "raw_root": str(directory / "raw"),
         "processed_root": str(directory / "processed"),
         "metadata_root": str(directory / "metadata"),
+        "data_catalog": {
+            "test": {
+                "path": str(directory / "raw"),
+                "signal_type": "eeg",
+            }
+        },
         "output_root": str(directory / "output"),
     }
     if stage == "brainomni":
@@ -54,7 +65,7 @@ def write_local_overlay(directory: Path, stage: str) -> Path:
 
 def write_metadata(config: dict[str, object], datasets: list[str]) -> None:
     """Write minimal generated preprocessing metadata for one test."""
-    directory = metadata_directory(config)
+    directory = preprocessing_directory(config)
     directory.mkdir(parents=True)
     metadata = [
         {"dataset": dataset, "path": f"{dataset}_{index}.pt"}
@@ -87,9 +98,13 @@ class PretrainConfigTest(unittest.TestCase):
                 source["campaign"]["data"]["included_datasets"],
                 ["*"],
             )
+            self.assertNotIn("signal_type", source["campaign"]["data"])
+            self.assertNotIn("raw_root", source["invocation"])
             config = load_pretrain_config(
-                ROOT / "configs/pretrain/braintokenizer.yaml",
-                write_local_overlay(root, "braintokenizer"),
+                [
+                    ROOT / "configs/pretrain/braintokenizer.yaml",
+                    write_local_overlay(root, "braintokenizer"),
+                ]
             )
             self.assertEqual(config["campaign"]["training"]["epochs"], 16)
             self.assertEqual(config["campaign"]["model"]["codebook_size"], 512)
@@ -109,9 +124,12 @@ class PretrainConfigTest(unittest.TestCase):
             shared_path = root / "shared.yaml"
             shared_path.write_text("campaign:\n  training:\n    epochs: 18\n")
             config = load_pretrain_config(
-                [base, shared_path],
-                write_local_overlay(root, "braintokenizer"),
-                ["campaign.training.epochs=20"],
+                [
+                    base,
+                    shared_path,
+                    write_local_overlay(root, "braintokenizer"),
+                ],
+                overrides=["campaign.training.epochs=20"],
             )
         self.assertEqual(config["campaign"]["training"]["epochs"], 20)
 
@@ -119,8 +137,10 @@ class PretrainConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = load_pretrain_config(
-                ROOT / "configs/pretrain/braintokenizer.yaml",
-                write_local_overlay(root, "braintokenizer"),
+                [
+                    ROOT / "configs/pretrain/braintokenizer.yaml",
+                    write_local_overlay(root, "braintokenizer"),
+                ]
             )
             invalid = deepcopy(config)
             invalid["campaign"]["unknown"] = True
@@ -130,9 +150,11 @@ class PretrainConfigTest(unittest.TestCase):
                 load_pretrain_config(path)
             with self.assertRaises(ConfigError):
                 load_pretrain_config(
-                    ROOT / "configs/pretrain/braintokenizer.yaml",
-                    write_local_overlay(root, "braintokenizer"),
-                    ["campaign.training.epochs=not-json"],
+                    [
+                        ROOT / "configs/pretrain/braintokenizer.yaml",
+                        write_local_overlay(root, "braintokenizer"),
+                    ],
+                    overrides=["campaign.training.epochs=not-json"],
                 )
             wildcard = deepcopy(config)
             wildcard["campaign"]["data"]["included_datasets"] = ["*"]
@@ -149,44 +171,218 @@ class PretrainConfigTest(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 validate_pretrain_config(non_integer)
 
-    def test_dataset_resolution_and_artifact_values(self) -> None:
+    def test_data_catalog_loading_and_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            catalog_path = root / "datasets.local.yaml"
+            (root / "eeg").mkdir()
+            (root / "meg").mkdir()
+            catalog_path.write_text(
+                "datasets:\n"
+                "  EEG-ONE:\n"
+                f"    path: {root / 'eeg'}\n"
+                "    signal_type: eeg\n"
+                "  MEG-ONE:\n"
+                f"    path: {root / 'meg'}\n"
+                "    signal_type: meg\n"
+            )
+            catalog = load_data_catalog(catalog_path)
+            self.assertEqual(sorted(catalog), ["EEG-ONE", "MEG-ONE"])
             overlay_path = write_local_overlay(root, "braintokenizer")
             overlay = json.loads(overlay_path.read_text())
             overlay["campaign"] = {"data": {"included_datasets": ["*"]}}
             overlay_path.write_text(json.dumps(overlay))
             config = load_pretrain_config(
-                ROOT / "configs/pretrain/braintokenizer.yaml",
-                overlay_path,
+                [
+                    ROOT / "configs/pretrain/braintokenizer.yaml",
+                    overlay_path,
+                ],
+                data_catalog_path=catalog_path,
+            )
+            self.assertEqual(
+                list(selected_data_catalog(config)),
+                ["EEG-ONE", "MEG-ONE"],
+            )
+            with mock.patch(
+                "pretrain_config.DATA_CATALOG_PATH",
+                catalog_path,
+            ):
+                automatic = load_pretrain_launch_config(
+                    [
+                        ROOT / "configs/pretrain/braintokenizer.yaml",
+                        overlay_path,
+                    ]
+                )
+            self.assertEqual(
+                automatic["invocation"]["data_catalog"],
+                catalog,
+            )
+            overlay["campaign"] = {"data": {"included_datasets": ["UNKNOWN"]}}
+            overlay_path.write_text(json.dumps(overlay))
+            with self.assertRaises(ConfigError):
+                load_pretrain_config(
+                    [
+                        ROOT / "configs/pretrain/braintokenizer.yaml",
+                        overlay_path,
+                    ],
+                    data_catalog_path=catalog_path,
+                )
+
+            catalog_path.write_text(
+                "datasets:\n"
+                "  DUPLICATE:\n"
+                f"    path: {root / 'one'}\n"
+                "    signal_type: eeg\n"
+                "  DUPLICATE:\n"
+                f"    path: {root / 'two'}\n"
+                "    signal_type: meg\n"
+            )
+            with self.assertRaises(ConfigError):
+                load_data_catalog(catalog_path)
+            catalog_path.write_text(
+                "datasets:\n"
+                "  INVALID:\n"
+                "    path: ''\n"
+                "    signal_type: ecog\n"
+            )
+            with self.assertRaises(ConfigError):
+                load_data_catalog(catalog_path)
+
+    def test_catalog_discovery_validates_roots_and_modalities(self) -> None:
+        class FakeRaw:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeAccessor:
+            def __init__(self) -> None:
+                self.roots: list[tuple[str, str]] = []
+
+            def search_brain_files(
+                self,
+                root_path: str,
+                dataset: str,
+            ) -> list[dict[str, str]]:
+                self.roots.append((root_path, dataset))
+                return [
+                    {
+                        "path": str(Path(root_path) / f"{dataset}.fif"),
+                        "dataset": dataset,
+                    }
+                ]
+
+            def read_brain_file(
+                self,
+                path: str,
+                preload: bool,
+            ) -> FakeRaw:
+                del path, preload
+                return FakeRaw()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            eeg_root = root / "eeg"
+            meg_root = root / "meg"
+            eeg_root.mkdir()
+            meg_root.mkdir()
+            config = {
+                "campaign": {"data": {"included_datasets": ["EEG", "MEG"]}},
+                "invocation": {
+                    "data_catalog": {
+                        "EEG": {
+                            "path": str(eeg_root),
+                            "signal_type": "eeg",
+                        },
+                        "MEG": {
+                            "path": str(meg_root),
+                            "signal_type": "meg",
+                        },
+                    }
+                },
+            }
+            accessor = FakeAccessor()
+            with mock.patch(
+                "factory.process.infer_signal_type",
+                side_effect=["eeg", "meg"],
+            ):
+                recordings = discover_catalog_recordings(accessor, config)
+            self.assertEqual(
+                accessor.roots,
+                [(str(eeg_root), "EEG"), (str(meg_root), "MEG")],
+            )
+            self.assertEqual(
+                [recording["signal_type"] for recording in recordings],
+                ["eeg", "meg"],
+            )
+            with mock.patch(
+                "factory.process.infer_signal_type",
+                return_value="eeg",
+            ):
+                with self.assertRaises(ConfigError):
+                    discover_catalog_recordings(accessor, config)
+            config["invocation"]["data_catalog"]["MEG"]["path"] = str(
+                root / "missing"
+            )
+            with self.assertRaises(ConfigError):
+                discover_catalog_recordings(accessor, config)
+
+    def test_split_excludes_all_nontraining_catalog_datasets(self) -> None:
+        rows = [
+            {"dataset": "TRAIN", "path": f"train-{index}"}
+            for index in range(20)
+        ]
+        rows.extend(
+            [
+                {"dataset": "HELD-A", "path": "held-a"},
+                {"dataset": "HELD-B", "path": "held-b"},
+            ]
+        )
+        train, validation, test, held_out = split_pretrain_metadata(
+            rows,
+            {"train": 0.8, "validation": 0.1, "test": 0.1},
+            ["TRAIN"],
+        )
+        split_rows = [*train, *validation, *test]
+        self.assertEqual({row["dataset"] for row in split_rows}, {"TRAIN"})
+        self.assertEqual(sorted(held_out), ["HELD-A", "HELD-B"])
+
+    def test_dataset_resolution_records_sorted_catalog_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for dataset in ("meg_a", "meg_b"):
+                (root / dataset).mkdir()
+            overlay_path = write_local_overlay(root, "braintokenizer")
+            overlay = json.loads(overlay_path.read_text())
+            overlay["campaign"] = {"data": {"included_datasets": ["*"]}}
+            overlay["invocation"]["data_catalog"] = {
+                "meg_a": {
+                    "path": str(root / "meg_a"),
+                    "signal_type": "meg",
+                },
+                "meg_b": {
+                    "path": str(root / "meg_b"),
+                    "signal_type": "meg",
+                },
+            }
+            overlay_path.write_text(json.dumps(overlay))
+            config = load_pretrain_config(
+                [
+                    ROOT / "configs/pretrain/braintokenizer.yaml",
+                    overlay_path,
+                ]
             )
             write_metadata(config, ["meg_b", "meg_a", "meg_b"])
             resolved = resolve_dataset_identities(config)
-            self.assertEqual(
-                resolved["campaign"]["data"]["included_datasets"],
-                ["meg_a", "meg_b"],
-            )
-            run_path = root / "run"
-            write_run_artifacts(run_path, resolved, {"window_length": 512})
-            artifact_paths = [
-                run_path / "model_cfg.json",
-                run_path / "pretrain_setting.yaml",
-                run_path / "pretrain_setting.json",
-                run_path / "invocation.yaml",
-            ]
-            for artifact_path in artifact_paths:
-                self.assertNotIn("*", artifact_path.read_text())
-            setting = yaml.safe_load(
-                (run_path / "pretrain_setting.yaml").read_text()
-            )
-            invocation = yaml.safe_load(
-                (run_path / "invocation.yaml").read_text()
-            )
         self.assertEqual(
-            setting["campaign"]["data"]["included_datasets"],
+            resolved["campaign"]["data"]["included_datasets"],
             ["meg_a", "meg_b"],
         )
-        self.assertEqual(invocation, resolved["invocation"])
+        self.assertNotIn(
+            str(root / "meg_a"),
+            yaml.safe_dump(resolved["campaign"]),
+        )
 
     def test_dataset_resolution_rejects_empty_and_mismatched_metadata(
         self,
@@ -194,13 +390,15 @@ class PretrainConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = load_pretrain_config(
-                ROOT / "configs/pretrain/braintokenizer.yaml",
-                write_local_overlay(root, "braintokenizer"),
+                [
+                    ROOT / "configs/pretrain/braintokenizer.yaml",
+                    write_local_overlay(root, "braintokenizer"),
+                ]
             )
             write_metadata(config, ["other"])
             with self.assertRaises(ConfigError):
                 resolve_dataset_identities(config)
-            info_path = metadata_directory(config) / "info.json"
+            info_path = preprocessing_directory(config) / "info.json"
             info_path.write_text("[]")
             with self.assertRaises(ConfigError):
                 resolve_dataset_identities(config)
@@ -209,12 +407,16 @@ class PretrainConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             tiny = load_pretrain_config(
-                ROOT / "configs/pretrain/brainomni_tiny.yaml",
-                write_local_overlay(root, "brainomni"),
+                [
+                    ROOT / "configs/pretrain/brainomni_tiny.yaml",
+                    write_local_overlay(root, "brainomni"),
+                ]
             )
             base = load_pretrain_config(
-                ROOT / "configs/pretrain/brainomni_base.yaml",
-                write_local_overlay(root, "brainomni"),
+                [
+                    ROOT / "configs/pretrain/brainomni_base.yaml",
+                    write_local_overlay(root, "brainomni"),
+                ]
             )
         self.assertEqual(tiny["campaign"]["model"]["lm_dim"], 256)
         self.assertEqual(tiny["campaign"]["model"]["lm_head"], 8)
@@ -225,16 +427,6 @@ class PretrainConfigTest(unittest.TestCase):
         self.assertEqual(base["campaign"]["model"]["lm_depth"], 12)
         self.assertEqual(base["campaign"]["optimizer"]["lr"], 0.0004)
         self.assertFalse((ROOT / "configs/pretrain/brainomni.yaml").exists())
-
-    def test_repository_log_directory_is_outside_run_artifacts(self) -> None:
-        run_path = ROOT / "temporary-artifacts" / "braintokenizer" / "exp_1"
-        log_path = repository_log_directory(run_path, "braintokenizer")
-        self.assertEqual(
-            log_path,
-            ROOT / "logs" / "braintokenizer" / "braintokenizer" / "exp_1",
-        )
-        with self.assertRaises(ConfigError):
-            repository_log_directory(run_path, "unknown")
 
     def test_stage_two_records_actual_tokenizer_identity(self) -> None:
         tokenizer_model = {
@@ -256,8 +448,10 @@ class PretrainConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = load_pretrain_config(
-                ROOT / "configs/pretrain/brainomni_tiny.yaml",
-                write_local_overlay(root, "brainomni"),
+                [
+                    ROOT / "configs/pretrain/brainomni_tiny.yaml",
+                    write_local_overlay(root, "brainomni"),
+                ]
             )
             tokenizer_path = root / "tokenizer"
             tokenizer_path.mkdir()
@@ -267,42 +461,57 @@ class PretrainConfigTest(unittest.TestCase):
             (tokenizer_path / "BrainTokenizer.pt").write_bytes(b"weights")
             write_metadata(config, ["test"])
             config = resolve_dataset_identities(config)
-            trainer_config = BrainOmniTrainerConfig(config, world_size=8)
+            tokenizer_health = CampaignHealth(
+                root=tokenizer_path,
+                stage="braintokenizer",
+                campaign_sha256="a" * 64,
+                model_config_sha256="b" * 64,
+                model_state_sha256="c" * 64,
+                portable_path=tokenizer_path / "BrainTokenizer.pt",
+                repaired=False,
+            )
+            with mock.patch(
+                "brainomni.config.ensure_campaign_health",
+                return_value=tokenizer_health,
+            ):
+                trainer_config = BrainOmniTrainerConfig(
+                    config,
+                    world_size=8,
+                )
             model_config = trainer_config.get_model_cfg()
             self.assertEqual(model_config["lm_dim"], 256)
             self.assertEqual(model_config["mask_ratio"], 0.5)
-            run_path = root / "run"
-            write_run_artifacts(
-                run_path,
-                config,
-                model_config,
+            self.assertEqual(
                 trainer_config.tokenizer_identity,
-            )
-            manifest = json.loads(
-                (run_path / "pretrain_setting.json").read_text()
+                {
+                    "campaign_sha256": "a" * 64,
+                    "model_config_sha256": "b" * 64,
+                    "model_state_sha256": "c" * 64,
+                },
             )
             json_path = root / "brainomni_tiny.json"
             json_path.write_text(json.dumps(config))
             json_config = load_pretrain_config(json_path)
         self.assertEqual(json_config, config)
-        self.assertEqual(
-            manifest["tokenizer_identity"],
-            trainer_config.tokenizer_identity,
-        )
 
     def test_portable_export_excludes_invocation_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = load_pretrain_config(
-                ROOT / "configs/pretrain/braintokenizer.yaml",
-                write_local_overlay(root, "braintokenizer"),
+                [
+                    ROOT / "configs/pretrain/braintokenizer.yaml",
+                    write_local_overlay(root, "braintokenizer"),
+                ]
             )
             write_metadata(config, ["test"])
             config = resolve_dataset_identities(config)
             run_path = root / "run"
             weights_path = root / "weights.pt"
             weights_path.write_bytes(b"weights")
-            write_run_artifacts(run_path, config, {"window_length": 512})
+            run_path.mkdir()
+            (run_path / "model_cfg.json").write_text("{}")
+            (run_path / "pretrain_setting.yaml").write_text("campaign: {}")
+            (run_path / "pretrain_setting.json").write_text("{}")
             export_checkpoint(
                 run_path,
                 weights_path,
@@ -340,9 +549,7 @@ class PretrainConfigTest(unittest.TestCase):
     def test_documentation_covers_schema_and_public_files_have_no_paths(
         self,
     ) -> None:
-        documentation = (
-            ROOT / "docs/pretraining_configuration.md"
-        ).read_text()
+        documentation = (ROOT / "docs/pretraining_configuration.md").read_text()
         self.assertIn(
             "docs/pretraining_configuration.md",
             (ROOT / "README.md").read_text(),
@@ -350,31 +557,53 @@ class PretrainConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             tokenizer = load_pretrain_config(
-                ROOT / "configs/pretrain/braintokenizer.yaml",
-                write_local_overlay(root, "braintokenizer"),
+                [
+                    ROOT / "configs/pretrain/braintokenizer.yaml",
+                    write_local_overlay(root, "braintokenizer"),
+                ]
             )
             brainomni = load_pretrain_config(
-                ROOT / "configs/pretrain/brainomni_tiny.yaml",
-                write_local_overlay(root, "brainomni"),
+                [
+                    ROOT / "configs/pretrain/brainomni_tiny.yaml",
+                    write_local_overlay(root, "brainomni"),
+                ]
             )
         keys = leaf_paths(tokenizer) | leaf_paths(brainomni)
-        missing = [key for key in keys if key not in documentation]
+        missing = [
+            key
+            for key in keys
+            if not key.startswith("invocation.data_catalog.")
+            and key not in documentation
+        ]
         self.assertFalse(missing)
         public_files = [
             ROOT / "docs/pretraining_configuration.md",
             ROOT / "configs/pretrain/braintokenizer.yaml",
             ROOT / "configs/pretrain/brainomni_tiny.yaml",
             ROOT / "configs/pretrain/brainomni_base.yaml",
+            ROOT / "configs/data/datasets.yaml",
             ROOT / "braintokenizer/launcher.py",
             ROOT / "brainomni/launcher.py",
             ROOT / "tests/test_pretrain_config.py",
         ]
-        data_prefix = "/" + "data" + "/"
-        home_prefix = "/" + "home" + "/"
+        template = yaml.safe_load(
+            (ROOT / "configs/data/datasets.yaml").read_text()
+        )
+        self.assertEqual(
+            template,
+            {
+                "datasets": {
+                    "DATASET_ID": {
+                        "path": None,
+                        "signal_type": "eeg",
+                    }
+                }
+            },
+        )
         for path in public_files:
             text = path.read_text()
-            self.assertNotIn(data_prefix, text)
-            self.assertNotIn(home_prefix, text)
+            self.assertNotIn("\n    path: /", text)
+            self.assertNotIn("/" + "home" + "/", text)
 
 
 if __name__ == "__main__":
