@@ -50,6 +50,7 @@ create_terminal_log() {
     BRAINOMNI_ATTEMPT_ID="${timestamp}-$$"
     TERMINAL_LOG_DIRECTORY="${PROJECT_ROOT}/logs/${stage}/pending"
     TERMINAL_LOG_DIRECTORY+="/${BRAINOMNI_ATTEMPT_ID}"
+    TERMINAL_LOG_STAGE="${stage}"
     TERMINAL_LOG_PATH="${TERMINAL_LOG_DIRECTORY}/terminal.log"
     BRAINOMNI_TERMINAL_LOG_PATH="${TERMINAL_LOG_PATH}"
     export BRAINOMNI_ATTEMPT_ID
@@ -57,12 +58,87 @@ create_terminal_log() {
     mkdir -p "${TERMINAL_LOG_DIRECTORY}"
 }
 
-run_with_terminal_log() {
-    printf 'Terminal log: %s\n' "${TERMINAL_LOG_PATH}" \
-        | tee -a "${TERMINAL_LOG_PATH}"
-    "$@" 2>&1 | tee -a "${TERMINAL_LOG_PATH}"
+write_terminal_log_message() {
+    local message="$1"
+
+    printf '%s\n' "${message}" >&2
+    printf '%s\n' "${message}" >> "${TERMINAL_LOG_PATH}"
 }
 
+move_terminal_log() {
+    local state="$1"
+    local destination_directory
+    local destination_path
+    local source_directory
+    local error_message
+
+    error_message="Could not remove empty terminal-log staging directory:"
+    source_directory="${TERMINAL_LOG_DIRECTORY}"
+    if [[ -z "${TERMINAL_LOG_STAGE:-}" ]]; then
+        fail "Cannot move a terminal log before creating it."
+    fi
+    [[ -f "${TERMINAL_LOG_PATH}" ]] || return 0
+    destination_directory="${PROJECT_ROOT}/logs/${TERMINAL_LOG_STAGE}/${state}"
+    destination_directory+="/${BRAINOMNI_ATTEMPT_ID}"
+    destination_path="${destination_directory}/terminal.log"
+    mkdir -p "${destination_directory}"
+    mv "${TERMINAL_LOG_PATH}" "${destination_path}"
+    if ! rmdir "${source_directory}"; then
+        fail "${error_message} ${source_directory}"
+    fi
+    TERMINAL_LOG_DIRECTORY="${destination_directory}"
+    TERMINAL_LOG_PATH="${destination_path}"
+    BRAINOMNI_TERMINAL_LOG_PATH="${destination_path}"
+    export BRAINOMNI_TERMINAL_LOG_PATH
+    write_terminal_log_message "Terminal log: ${destination_path}"
+}
+
+log_config_paths() {
+    local argument
+    local reading_configs=false
+    local resolved_path
+
+    write_terminal_log_message "Configuration files, in precedence order:"
+    for argument in "$@"; do
+        if [[ "${argument}" == "--config" ]]; then
+            reading_configs=true
+            continue
+        fi
+        if [[ "${reading_configs}" == true ]]; then
+            if [[ "${argument}" == --* ]]; then
+                reading_configs=false
+            else
+                resolved_path="$(realpath -e "${argument}")" || fail \
+                    "Could not resolve configuration file: ${argument}"
+                write_terminal_log_message "  ${resolved_path}"
+                continue
+            fi
+        fi
+    done
+}
+
+filter_progress_bars() {
+    local line
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ "${line}" == *$'\r'* ]] || printf '%s\n' "${line}"
+    done
+}
+
+run_with_terminal_log() {
+    local log_path="${TERMINAL_LOG_PATH}"
+    local status
+
+    write_terminal_log_message "Terminal log: ${log_path}"
+    if "$@" 2>&1 | tee /dev/stderr | filter_progress_bars >> "${log_path}"; then
+        return 0
+    else
+        status=$?
+    fi
+
+    move_terminal_log "failed"
+    return "${status}"
+}
 select_vacant_gpus() {
     local requested="$1"
     local inventory

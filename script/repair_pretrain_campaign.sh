@@ -36,5 +36,5 @@ done
     "--campaign-root is required. Pass the semantic campaign directory."
 cd "${PROJECT_ROOT}"
 unset CUDA_VISIBLE_DEVICES
-"${PYTHON_BIN}" factory/campaign_health.py \
+"${PYTHON_BIN}" -m factory.campaign_health \
     --campaign-root "${campaign_root}" "${arguments[@]}"

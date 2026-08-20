@@ -2,7 +2,7 @@
 
 Usage
 -----
-``python factory/campaign_health.py --campaign-root CAMPAIGN [--check-only]``
+``python -m factory.campaign_health --campaign-root CAMPAIGN [--check-only]``
 
 Input is a BrainTokenizer or BrainOmni semantic campaign root. Successful
 output reports the verified stage, campaign identity, portable path, and

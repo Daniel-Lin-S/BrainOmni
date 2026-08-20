@@ -40,7 +40,8 @@ select_vacant_gpus "${num_gpus}"
 create_terminal_log "braintokenizer"
 cd "${PROJECT_ROOT}"
 
+log_config_paths "${arguments[@]}"
 run_with_terminal_log \
     printf 'Selected CUDA devices: %s\n' "${CUDA_VISIBLE_DEVICES}"
 run_with_terminal_log deepspeed --num_gpus="${num_gpus}" \
-    braintokenizer/launcher.py "${arguments[@]}"
+    --module braintokenizer.launcher "${arguments[@]}"

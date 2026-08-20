@@ -394,9 +394,13 @@ def process(
     bad_channels = auto_detect_bad_channels(raw, eeg_mask, mag_mask, grad_mask)
     if len(bad_channels) > 0:
         raw.info["bads"] += bad_channels
-    raw.interpolate_bads(
-        reset_bads=True, mode="accurate", origin=(0.0, 0.0, 0.04), verbose=False
-    )
+    if raw.info["bads"]:
+        raw.interpolate_bads(
+            reset_bads=True,
+            mode="accurate",
+            origin=(0.0, 0.0, 0.04),
+            verbose=False,
+        )
 
     data = raw.get_data()
     del raw

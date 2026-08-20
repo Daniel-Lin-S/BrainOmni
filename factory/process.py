@@ -39,7 +39,7 @@ def discover_catalog_recordings(
     config: dict,
 ) -> list[dict[str, str]]:
     """Discover and validate recordings from every selected catalog root."""
-    catalog = selected_data_catalog(config, include_held_out=True)
+    catalog = selected_data_catalog(config)
     recordings: list[dict[str, str]] = []
     for dataset, definition in catalog.items():
         root = Path(definition["path"]).resolve()

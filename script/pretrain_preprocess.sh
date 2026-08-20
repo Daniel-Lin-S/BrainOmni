@@ -20,5 +20,7 @@ require_config_argument "$@"
 create_terminal_log "preprocess"
 cd "${PROJECT_ROOT}"
 
+log_config_paths "$@"
 unset CUDA_VISIBLE_DEVICES
-run_with_terminal_log "${PYTHON_BIN}" factory/process.py "$@"
+run_with_terminal_log "${PYTHON_BIN}" -m factory.process "$@"
+move_terminal_log "complete"

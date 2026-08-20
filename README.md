@@ -79,7 +79,7 @@ checkpoint-export workflow, see
 
 ### Data preprocessing
 
-Run `factory/process.py` with the same tracked configuration and ignored local
+Run `python -m factory.process` with the same tracked configuration and ignored local
 overlay that will be used for training. The configuration reference contains
 the supported layered command syntax and metadata-verification requirements.
 
@@ -98,8 +98,8 @@ A successful Stage-1 run writes `BrainTokenizer.pt` automatically beside
 
 ### Data preprocessing
 1. Set the downstream dataset location in your ignored local configuration.
-2. Run the corresponding preprocessing code : `python downstream/dataset_maker/make_xx.py`
-3. Run `python downstream/dataset_maker/dataset_spliter.py` to split the data into 5-fold(cross-subject). 
+2. Run the corresponding preprocessing module from the repository root.
+3. Run `python -m downstream.dataset_maker.dataset_spliter` to split the data into 5-fold(cross-subject).
 
 ### Downstream evaluation
 Considering that the baseline and our model have different architectures and parameter sizes, for each model and each dataset, we conducted experiments using three learning rates (3e-6, 1e-5, 3e-5) selected the best-performing learning rate as the configuration.  
@@ -113,7 +113,7 @@ sh script/evaluation.sh
 Use the following command to calculate the average results of 10-fold cross-validation in an experiment.
 ```bash 
 # The average results will be saved in exp_results_downstream/results.csv
-python downstream/metrics_stat.py
+python -m downstream.metrics_stat
 ```
 
 ## 📢 Citation

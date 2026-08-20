@@ -327,6 +327,25 @@ class PretrainConfigTest(unittest.TestCase):
             )
             with self.assertRaises(ConfigError):
                 discover_catalog_recordings(accessor, config)
+            config["invocation"]["data_catalog"]["MEG"]["path"] = str(
+                meg_root
+            )
+            config["campaign"]["data"]["included_datasets"] = ["EEG"]
+            config["invocation"]["held_out_evaluation_datasets"] = ["MEG"]
+            held_out_accessor = FakeAccessor()
+            with mock.patch(
+                "factory.process.infer_signal_type",
+                return_value="eeg",
+            ):
+                held_out_recordings = discover_catalog_recordings(
+                    held_out_accessor,
+                    config,
+                )
+            self.assertEqual(held_out_accessor.roots, [(str(eeg_root), "EEG")])
+            self.assertEqual(
+                [recording["dataset"] for recording in held_out_recordings],
+                ["EEG"],
+            )
 
     def test_split_excludes_all_nontraining_catalog_datasets(self) -> None:
         rows = [

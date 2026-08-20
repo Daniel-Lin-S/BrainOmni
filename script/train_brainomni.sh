@@ -41,7 +41,8 @@ select_vacant_gpus "${num_gpus}"
 create_terminal_log "brainomni"
 cd "${PROJECT_ROOT}"
 
+log_config_paths "${arguments[@]}"
 run_with_terminal_log \
     printf 'Selected CUDA devices: %s\n' "${CUDA_VISIBLE_DEVICES}"
 run_with_terminal_log deepspeed --num_gpus="${num_gpus}" \
-    brainomni/launcher.py "${arguments[@]}"
+    --module brainomni.launcher "${arguments[@]}"
