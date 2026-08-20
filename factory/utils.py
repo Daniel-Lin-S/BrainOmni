@@ -17,6 +17,8 @@ from factory.brain_constant import (
 )
 from accessor import DataAccessor, write_torch_warpper
 
+MNE_PREPROCESS_JOBS = 1
+
 
 def filter_channel(raw, dataset: str):
     exclude = []
@@ -197,13 +199,27 @@ def filter_resample_preprocess(
     low_frequency_hz: float,
     high_frequency_hz: float,
 ):
+    """Filter and resample one recording without nested worker pools."""
     notch_freqs = [50, 60]
-    if len(notch_freqs) > 0:
-        raw = raw.notch_filter(freqs=notch_freqs, verbose=False)
+    if notch_freqs:
+        raw = raw.notch_filter(
+            freqs=notch_freqs,
+            n_jobs=MNE_PREPROCESS_JOBS,
+            verbose=False,
+        )
     if dataset in HPI_LIST:
         raw = mne.chpi.filter_chpi(raw, include_line=False, verbose=False)
-    raw = raw.resample(sample_rate_hz, verbose=False, n_jobs=2)
-    raw = raw.filter(low_frequency_hz, high_frequency_hz, verbose=False)
+    raw = raw.resample(
+        sample_rate_hz,
+        n_jobs=MNE_PREPROCESS_JOBS,
+        verbose=False,
+    )
+    raw = raw.filter(
+        low_frequency_hz,
+        high_frequency_hz,
+        n_jobs=MNE_PREPROCESS_JOBS,
+        verbose=False,
+    )
     return raw
 
 
@@ -270,6 +286,8 @@ def split_to_segments_save(
     dataset: str,
     dataset_root: str,
     ready_path: str,
+    raw_duration_seconds: float,
+    preprocessed_duration_seconds: float,
     signal_type: str,
     sample_rate_hz: float,
     TIME: int,
@@ -313,6 +331,21 @@ def split_to_segments_save(
                 "channels": seg_data.shape[0],
                 "signal_type": signal_type,
                 "is_eeg": bool((sensor_type == SENSOR_TYPE_DICT["EEG"]).all()),
+                "source_recording": relative_path.as_posix(),
+                "raw_duration_seconds": raw_duration_seconds,
+                "preprocessed_duration_seconds": (
+                    preprocessed_duration_seconds
+                ),
+                "window_modality": (
+                    "eeg"
+                    if eeg_mask.all()
+                    else "meg"
+                    if meg_mask.all()
+                    else "emeg"
+                ),
+                "eeg_channels": int(eeg_mask.sum()),
+                "meg_channels": int(mag_mask.sum()),
+                "grad_channels": int(grad_mask.sum()),
                 "is_meg": bool(
                     (
                         (sensor_type == SENSOR_TYPE_DICT["MAG"])
@@ -378,6 +411,7 @@ def process(
     raw = rename_channel(raw, dataset)
     raw = filter_channel(raw, dataset)
     raw = set_montage(raw, dataset)
+    raw_duration_seconds = raw.n_times / raw.info["sfreq"]
 
     pos, sensor_type = extract_pos_sensor_type(raw.info)
     eeg_mask, mag_mask, grad_mask, meg_mask = get_sensor_type_mask(sensor_type)
@@ -390,6 +424,7 @@ def process(
         low_frequency_hz,
         high_frequency_hz,
     )
+    preprocessed_duration_seconds = raw.n_times / raw.info["sfreq"]
 
     bad_channels = auto_detect_bad_channels(raw, eeg_mask, mag_mask, grad_mask)
     if len(bad_channels) > 0:
@@ -418,9 +453,27 @@ def process(
         dataset,
         dataset_root,
         ready_path,
+        raw_duration_seconds,
+        preprocessed_duration_seconds,
         signal_type,
         sample_rate_hz,
         TIME,
         STRIDE,
     )
-    return segments_metadata, path
+    root_path = Path(dataset_root).resolve()
+    raw_path = Path(path).resolve()
+    try:
+        source_recording = raw_path.relative_to(root_path).as_posix()
+    except ValueError as error:
+        raise ValueError(
+            f"Recording {raw_path} is outside configured root {root_path}."
+        ) from error
+    completion = {
+        "recording_path": str(raw_path),
+        "dataset": dataset,
+        "source_recording": source_recording,
+        "raw_duration_seconds": raw_duration_seconds,
+        "preprocessed_duration_seconds": preprocessed_duration_seconds,
+        "generated_windows": len(segments_metadata),
+    }
+    return segments_metadata, completion

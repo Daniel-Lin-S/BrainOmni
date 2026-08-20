@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
 import json
 from pathlib import Path
 import sys
@@ -17,7 +18,13 @@ from brainomni.config import BrainOmniTrainerConfig
 from factory.checkpoint import convert_best_checkpoint
 from factory.campaign import CampaignHealth
 from factory.export_pretrained import export_checkpoint
-from factory.process import discover_catalog_recordings
+from factory.process import (
+    build_dataset_snapshots,
+    discover_catalog_recordings,
+    log_dataset_snapshots,
+    migrate_legacy_completion_records,
+    read_finish_records,
+)
 from factory.utils import split_pretrain_metadata
 from pretrain_config import (
     ConfigError,
@@ -248,10 +255,19 @@ class PretrainConfigTest(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_data_catalog(catalog_path)
 
-    def test_catalog_discovery_validates_roots_and_modalities(self) -> None:
+    @mock.patch(
+        "factory.process.describe_recording_channels",
+        return_value=(0, 1, 0),
+    )
+    def test_catalog_discovery_validates_roots_and_modalities(
+        self,
+        _channel_counts: mock.Mock,
+    ) -> None:
         class FakeRaw:
             def __init__(self) -> None:
                 self.closed = False
+                self.info = {"sfreq": 100.0}
+                self.n_times = 1000
 
             def close(self) -> None:
                 self.closed = True
@@ -346,6 +362,121 @@ class PretrainConfigTest(unittest.TestCase):
                 [recording["dataset"] for recording in held_out_recordings],
                 ["EEG"],
             )
+
+    def test_dataset_snapshots_cover_windows_and_recordings(self) -> None:
+        records = [
+            {
+                "recording_path": "e",
+                "dataset": "EEG",
+                "source_recording": "e",
+                "raw_duration_seconds": 10.0,
+                "preprocessed_duration_seconds": 10.0,
+                "generated_windows": 1,
+            },
+            {
+                "recording_path": "m",
+                "dataset": "MEG",
+                "source_recording": "m",
+                "raw_duration_seconds": 20.0,
+                "preprocessed_duration_seconds": 19.5,
+                "generated_windows": 1,
+            },
+            {
+                "recording_path": "b",
+                "dataset": "MEG",
+                "source_recording": "b",
+                "raw_duration_seconds": 5.0,
+                "preprocessed_duration_seconds": 5.0,
+                "generated_windows": 1,
+            },
+            {
+                "recording_path": "z",
+                "dataset": "MEG",
+                "source_recording": "z",
+                "raw_duration_seconds": 2.0,
+                "preprocessed_duration_seconds": 2.0,
+                "generated_windows": 0,
+            },
+        ]
+        metadata = [
+            {
+                "dataset": "EEG", "source_recording": "e", "channels": 2,
+                "window_modality": "eeg", "eeg_channels": 2,
+                "meg_channels": 0, "grad_channels": 0,
+            },
+            {
+                "dataset": "MEG", "source_recording": "m", "channels": 3,
+                "window_modality": "meg", "eeg_channels": 0,
+                "meg_channels": 2, "grad_channels": 1,
+            },
+            {
+                "dataset": "MEG", "source_recording": "b", "channels": 4,
+                "window_modality": "emeg", "eeg_channels": 1,
+                "meg_channels": 1, "grad_channels": 2,
+            },
+        ]
+        snapshots = build_dataset_snapshots(records, metadata)
+        aggregate = snapshots["aggregate"]
+        self.assertEqual(aggregate["completed_recordings"], 4)
+        self.assertEqual(aggregate["generated_windows"], 3)
+        self.assertEqual(aggregate["raw_duration_seconds"], 37.0)
+        self.assertEqual(aggregate["preprocessed_duration_seconds"], 36.5)
+        self.assertEqual(
+            aggregate["window_channel_count"],
+            {"min": 2, "max": 4, "median": 3},
+        )
+        self.assertEqual(
+            aggregate["window_modality_proportions"],
+            {"eeg": 1 / 3, "meg": 1 / 3, "emeg": 1 / 3},
+        )
+        self.assertEqual(
+            aggregate["channel_proportions"],
+            {"eeg": 1 / 3, "meg": 1 / 3, "grad": 1 / 3},
+        )
+        logger = logging.getLogger("preprocessing-summary-test")
+        with self.assertLogs(logger, level="INFO") as captured:
+            log_dataset_snapshots(logger, snapshots)
+        output = "\n".join(captured.output)
+        self.assertIn("snapshot aggregate: recordings=4", output)
+        self.assertIn("dataset=MEG", output)
+        records, legacy_paths = read_finish_records(["/tmp/legacy.fif"])
+        self.assertEqual(records, [])
+        self.assertEqual(legacy_paths, ["/tmp/legacy.fif"])
+
+    def test_legacy_completion_migration_uses_discovery_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_path = root / "recording.fif"
+            raw_path.touch()
+            completions = migrate_legacy_completion_records(
+                [str(raw_path)],
+                [
+                    {
+                        "path": str(raw_path),
+                        "dataset": "MEG",
+                        "dataset_root": str(root),
+                        "raw_sample_rate_hz": 600.0,
+                        "raw_samples": 601,
+                        "eeg_channels": 0,
+                        "meg_channels": 1,
+                        "grad_channels": 0,
+                    }
+                ],
+                [],
+                str(root / "processed"),
+                256.0,
+                logging.getLogger("legacy-migration-test"),
+            )
+        self.assertEqual(len(completions), 1)
+        completion = completions[0]
+        self.assertEqual(completion["dataset"], "MEG")
+        self.assertEqual(completion["source_recording"], "recording.fif")
+        self.assertEqual(completion["generated_windows"], 0)
+        self.assertEqual(completion["raw_duration_seconds"], 601 / 600)
+        self.assertEqual(
+            completion["preprocessed_duration_seconds"],
+            round(256 / 600 * 601) / 256,
+        )
 
     def test_split_excludes_all_nontraining_catalog_datasets(self) -> None:
         rows = [

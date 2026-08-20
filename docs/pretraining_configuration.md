@@ -155,6 +155,6 @@ held-out datasets are entire catalog datasets absent from train, validation,
 and test. Missing compatible held-out preprocessing is recorded and skipped;
 the warning gives the exact preprocessing command.
 
-## 6. Campaign artifacts and recovery
-
-See [Campaign artifacts and recovery](pretraining_campaign_artifacts.md).
+Each preprocessing worker runs its MNE filtering and resampling steps with
+`n_jobs=1`. Parallelism comes only from `invocation.preprocess_workers`, which
+avoids nested joblib worker pools and their temporary-resource cleanup warnings.

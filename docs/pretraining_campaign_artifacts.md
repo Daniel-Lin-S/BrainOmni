@@ -87,6 +87,7 @@ Preprocessing reuses recording work while isolating semantic splits:
 <metadata_root>/<preprocessing-id>/
 ├── info.json                   processed segment identities and modalities
 ├── finish.json                 raw recordings completed successfully
+├── dataset_snapshots.json      aggregate and per-dataset recording snapshots
 └── splits_<split-id>/
     ├── train.json              optimization segment metadata
     ├── val.json                checkpoint-selection segment metadata
