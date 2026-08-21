@@ -185,7 +185,25 @@ class BrainOmni(nn.Module):
         return None
 
     @torch.jit.ignore
-    def get_parameters_groups(self, lr: float, weight_decay: float):
+    def get_named_parameter_groups(
+        self,
+        lr: float,
+        weight_decay: float,
+    ) -> dict[str, dict[str, object]]:
+        """Return ordered, named, non-empty optimizer parameter groups.
+
+        Parameters
+        ----------
+        lr : float
+            Learning rate for every trainable parameter.
+        weight_decay : float
+            Weight decay for main parameters.
+
+        Returns
+        -------
+        dict[str, dict[str, object]]
+            Ordered mapping from monitor name to DeepSpeed group settings.
+        """
         no_decay_params = []
         normal_params = []
         for n, p in self.named_parameters():
@@ -199,10 +217,36 @@ class BrainOmni(nn.Module):
                 else:
                     normal_params.append(p)
 
-        return [
-            {"params": normal_params, "lr": lr, "weight_decay": weight_decay},
-            {"params": no_decay_params, "lr": lr, "weight_decay": 0.0},
-        ]
+        candidates = {
+            "main": {
+                "params": normal_params,
+                "lr": lr,
+                "weight_decay": weight_decay,
+            },
+            "no_decay": {
+                "params": no_decay_params,
+                "lr": lr,
+                "weight_decay": 0.0,
+            },
+        }
+        return {
+            name: group
+            for name, group in candidates.items()
+            if group["params"]
+        }
+
+    @torch.jit.ignore
+    def get_parameters_groups(
+        self,
+        lr: float,
+        weight_decay: float,
+    ) -> list[dict[str, object]]:
+        """Return non-empty parameter groups for external optimizers."""
+        groups = self.get_named_parameter_groups(
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        return list(groups.values())
 
     def forward(
         self,

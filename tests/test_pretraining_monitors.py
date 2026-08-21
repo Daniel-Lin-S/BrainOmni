@@ -209,6 +209,28 @@ class PretrainingMonitorTest(unittest.TestCase):
             atol=0,
         )
 
+    def test_stage_two_optimizer_groups_are_named_and_non_empty(self) -> None:
+        """Keep Stage-2 monitor names aligned with optimizer groups."""
+        model = BrainOmni.__new__(BrainOmni)
+        torch.nn.Module.__init__(model)
+        model.main_projection = torch.nn.Linear(2, 2)
+        model.norm_projection = torch.nn.Linear(2, 2)
+        groups = model.get_named_parameter_groups(
+            lr=4e-4,
+            weight_decay=0.05,
+        )
+        self.assertEqual(tuple(groups), ("main", "no_decay"))
+        self.assertTrue(all(group["params"] for group in groups.values()))
+        grouped_ids = {
+            id(parameter)
+            for group in groups.values()
+            for parameter in group["params"]
+        }
+        self.assertEqual(
+            grouped_ids,
+            {id(parameter) for parameter in model.parameters()},
+        )
+
     def test_assignment_and_residual_metrics(self) -> None:
         counts = torch.tensor([[2.0, 2.0, 0.0, 0.0]])
         metrics = assignment_metrics(counts)
@@ -487,6 +509,19 @@ class PretrainingMonitorTest(unittest.TestCase):
             ].item(),
             5.0,
         )
+        self.assertNotIn(
+            "train/step/optimization/learning_rate/codebook",
+            values,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "expected 3 learning rates, got 2",
+        ):
+            optimizer_step_values(
+                engine,
+                [0.1, 0.2],
+                ("main", "no_decay", "codebook"),
+            )
 
     def test_cadence_handles_skips_and_resume(self) -> None:
         engine = FakeEngine([torch.tensor([1.0])])

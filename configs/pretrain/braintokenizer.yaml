@@ -41,6 +41,7 @@ campaign:
     weight_decay: 0.01
   scheduler:
     warmup_ratio: 0.1
+    warmup_min_lr_ratio: 0.0
     cosine_min_ratio: 0.05
   training:
     epochs: 16

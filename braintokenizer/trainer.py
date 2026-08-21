@@ -1,5 +1,6 @@
-from pathlib import Path
 import os
+from pathlib import Path
+
 import torch
 import logging
 from urllib.parse import quote
@@ -29,6 +30,7 @@ from factory.training_runtime import (
     save_distributed_checkpoint,
     write_evaluation_metrics,
 )
+from factory.lr_scheduler import warmup_cosine_scheduler_factory
 from braintokenizer.config import BrainTokenizerTrainerConfig
 from braintokenizer.model import BrainTokenizer
 from braintokenizer.metrics import MetricsComputer
@@ -116,13 +118,7 @@ class Trainer:
         self.logger.info(
             "=> Building model and initializing distributed environment..."
         )
-        self.cfg.ds_config["scheduler"]["params"][
-            "total_num_steps"
-        ] = train_total_steps
-        self.cfg.ds_config["scheduler"]["params"]["warmup_num_steps"] = int(
-            train_total_steps * self.cfg.scheduler_warm_ratio
-        )
-        self.model = self.deepspeed_initialize()
+        self.model = self.deepspeed_initialize(train_total_steps)
         if self.training_required:
             restored = resume_distributed_checkpoint(
                 self.model,
@@ -482,7 +478,7 @@ class Trainer:
             optimizer_step_values(
                 self.model,
                 learning_rates,
-                ("main", "no_decay", "codebook"),
+                self.optimizer_group_names,
             )
         )
         if self.rank == 0:
@@ -634,19 +630,31 @@ class Trainer:
             self.rank,
         )
 
-    def deepspeed_initialize(self):
+    def deepspeed_initialize(self, train_total_steps: int):
+        """Build the model, optimizer groups, scheduler, and engine."""
         model = BrainTokenizer(
             **self.cfg.get_model_cfg(),
             channel_mask_ratio=self.cfg.channel_mask_ratio,
             noise_std=self.cfg.noise_std,
         )
+        parameter_groups = model.get_named_parameter_groups(
+            lr=self.cfg.lr,
+            codebook_lr=self.cfg.codebook_lr,
+            weight_decay=self.cfg.weight_decay,
+        )
+        self.optimizer_group_names = tuple(parameter_groups)
+        scheduler_factory = warmup_cosine_scheduler_factory(
+            total_num_steps=train_total_steps,
+            warmup_ratio=self.cfg.scheduler_warm_ratio,
+            warmup_min_lr_ratio=(
+                self.cfg.scheduler_warmup_min_lr_ratio
+            ),
+            cosine_min_ratio=self.cfg.scheduler_cosine_min_ratio,
+        )
         model, _, _, _ = deepspeed.initialize(
             model=model,
-            model_parameters=model.get_parameters_groups(
-                lr=self.cfg.lr,
-                codebook_lr=self.cfg.codebook_lr,
-                weight_decay=self.cfg.weight_decay,
-            ),
+            model_parameters=list(parameter_groups.values()),
+            lr_scheduler=scheduler_factory,
             config=self.cfg.ds_config,
         )
         n_parameters = sum(

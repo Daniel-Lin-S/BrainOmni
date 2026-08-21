@@ -145,7 +145,28 @@ class BrainTokenizer(nn.Module):
             nn.init.trunc_normal_(m, std=0.02)
 
     @torch.jit.ignore
-    def get_parameters_groups(self, lr: float, codebook_lr: float, weight_decay: float):
+    def get_named_parameter_groups(
+        self,
+        lr: float,
+        codebook_lr: float,
+        weight_decay: float,
+    ) -> dict[str, dict[str, object]]:
+        """Return ordered, named, non-empty optimizer parameter groups.
+
+        Parameters
+        ----------
+        lr : float
+            Learning rate for main and no-decay parameters.
+        codebook_lr : float
+            Learning rate for trainable quantizer parameters.
+        weight_decay : float
+            Weight decay for main parameters.
+
+        Returns
+        -------
+        dict[str, dict[str, object]]
+            Ordered mapping from monitor name to DeepSpeed group settings.
+        """
         normal_params = []
         no_decay_params = []
         codebook_params = []
@@ -159,11 +180,43 @@ class BrainTokenizer(nn.Module):
                     codebook_params.append(p)
                 else:
                     normal_params.append(p)
-        return [
-            {"params": normal_params, "lr": lr, "weight_decay": weight_decay},
-            {"params": no_decay_params, "lr": lr, "weight_decay": 0.0},
-            {"params": codebook_params, "lr": codebook_lr, "weight_decay": 0.0},
-        ]
+        candidates = {
+            "main": {
+                "params": normal_params,
+                "lr": lr,
+                "weight_decay": weight_decay,
+            },
+            "no_decay": {
+                "params": no_decay_params,
+                "lr": lr,
+                "weight_decay": 0.0,
+            },
+            "codebook": {
+                "params": codebook_params,
+                "lr": codebook_lr,
+                "weight_decay": 0.0,
+            },
+        }
+        return {
+            name: group
+            for name, group in candidates.items()
+            if group["params"]
+        }
+
+    @torch.jit.ignore
+    def get_parameters_groups(
+        self,
+        lr: float,
+        codebook_lr: float,
+        weight_decay: float,
+    ) -> list[dict[str, object]]:
+        """Return non-empty parameter groups for external optimizers."""
+        groups = self.get_named_parameter_groups(
+            lr=lr,
+            codebook_lr=codebook_lr,
+            weight_decay=weight_decay,
+        )
+        return list(groups.values())
 
     def unfold(self, x: torch.Tensor, overlap_ratio: float = 0.0):
         if x.shape[-1] < self.window_length:

@@ -96,6 +96,45 @@ class BrainTokenizerTrainingBehaviorTest(unittest.TestCase):
                 noise_std=-0.1,
             )
 
+    def test_optimizer_groups_omit_empty_ema_codebook(self) -> None:
+        """Name every non-empty optimizer group exactly once."""
+        model = BrainTokenizer(**SMALL_TOKENIZER_CONFIG)
+        groups = model.get_named_parameter_groups(
+            lr=2e-4,
+            codebook_lr=3e-4,
+            weight_decay=0.01,
+        )
+        self.assertEqual(tuple(groups), ("main", "no_decay"))
+        grouped_ids = [
+            id(parameter)
+            for group in groups.values()
+            for parameter in group["params"]
+        ]
+        trainable_ids = [
+            id(parameter)
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ]
+        self.assertCountEqual(grouped_ids, trainable_ids)
+        self.assertEqual(len(grouped_ids), len(set(grouped_ids)))
+
+    def test_optimizer_groups_include_trainable_quantizer(self) -> None:
+        """Apply codebook LR when quantizer projections are trainable."""
+        config = dict(SMALL_TOKENIZER_CONFIG)
+        config["codebook_dim"] = 4
+        model = BrainTokenizer(**config)
+        groups = model.get_named_parameter_groups(
+            lr=2e-4,
+            codebook_lr=3e-4,
+            weight_decay=0.01,
+        )
+        self.assertEqual(
+            tuple(groups),
+            ("main", "no_decay", "codebook"),
+        )
+        self.assertEqual(groups["codebook"]["lr"], 3e-4)
+        self.assertTrue(groups["codebook"]["params"])
+
     def test_monitor_attention_disables_only_its_dropout(self) -> None:
         """Use zero dropout for monitor attention without changing training."""
         module = BackWardSolution(n_dim=4, n_head=1, dropout=0.3)

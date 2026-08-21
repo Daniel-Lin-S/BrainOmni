@@ -29,6 +29,7 @@ from factory.utils import split_pretrain_metadata
 from pretrain_config import (
     ConfigError,
     build_deepspeed_config,
+    canonical_config_sha256,
     load_data_catalog,
     load_pretrain_config,
     load_pretrain_launch_config,
@@ -118,7 +119,16 @@ class PretrainConfigTest(unittest.TestCase):
                 config["campaign"]["objective"]["noise_std"],
                 0.1,
             )
-            _, accumulation = build_deepspeed_config(config, world_size=8)
+            self.assertEqual(
+                config["campaign"]["scheduler"][
+                    "warmup_min_lr_ratio"
+                ],
+                0.0,
+            )
+            ds_config, accumulation = build_deepspeed_config(
+                config,
+                world_size=8,
+            )
             json_path = root / "braintokenizer.json"
             json_path.write_text(json.dumps(config))
             json_config = load_pretrain_config(json_path)
@@ -131,6 +141,7 @@ class PretrainConfigTest(unittest.TestCase):
             },
         )
         self.assertEqual(accumulation, 4)
+        self.assertNotIn("scheduler", ds_config)
         with self.assertRaises(ConfigError):
             build_deepspeed_config(config, world_size=3)
 
@@ -208,6 +219,36 @@ class PretrainConfigTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ConfigError, "finite.*noise_std"):
                 validate_pretrain_config(invalid_noise)
+            missing_warmup_minimum = deepcopy(config)
+            del missing_warmup_minimum["campaign"]["scheduler"][
+                "warmup_min_lr_ratio"
+            ]
+            with self.assertRaisesRegex(
+                ConfigError,
+                "warmup_min_lr_ratio",
+            ):
+                validate_pretrain_config(missing_warmup_minimum)
+            invalid_warmup_minimum = deepcopy(config)
+            invalid_warmup_minimum["campaign"]["scheduler"][
+                "warmup_min_lr_ratio"
+            ] = 1.1
+            with self.assertRaisesRegex(
+                ConfigError,
+                "warmup_min_lr_ratio",
+            ):
+                validate_pretrain_config(invalid_warmup_minimum)
+
+    def test_warmup_minimum_changes_campaign_identity(self) -> None:
+        """Include the initial learning-rate multiplier in provenance."""
+        source = yaml.safe_load(
+            (ROOT / "configs/pretrain/braintokenizer.yaml").read_text()
+        )
+        changed = deepcopy(source)
+        changed["campaign"]["scheduler"]["warmup_min_lr_ratio"] = 0.1
+        self.assertNotEqual(
+            canonical_config_sha256(source["campaign"]),
+            canonical_config_sha256(changed["campaign"]),
+        )
 
     def test_tokenizer_noise_default_is_materialized(self) -> None:
         """Persist the semantic noise default when a config omits it."""

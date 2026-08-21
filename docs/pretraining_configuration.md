@@ -83,11 +83,12 @@ Campaign settings are checkpoint-semantic and are saved in `pretrain_setting.yam
 | `campaign.objective.noise_std` | non-negative float, `.1` | Gaussian input-noise standard deviation used only during training. |
 | `campaign.optimizer.type` | `AdamW`, `AdamW` | Optimizer implementation. |
 | `campaign.optimizer.lr` | positive float, `2e-4` | Main parameter learning rate. |
-| `campaign.optimizer.codebook_lr` | positive float, `3e-4` | RVQ codebook learning rate. |
+| `campaign.optimizer.codebook_lr` | positive float, `3e-4` | Learning rate for trainable quantizer projections; EMA codebook buffers are not optimized. |
 | `campaign.optimizer.betas` | two fractions [0,1), `[.5,.9]` | AdamW moment coefficients. |
 | `campaign.optimizer.eps` | positive float, `1e-5` | AdamW numerical stabilizer. |
 | `campaign.optimizer.weight_decay` | non-negative float, `.01` | Main-parameter L2 regularization. |
-| `campaign.scheduler.warmup_ratio` | fraction [0,1], `.1` | Initial warmup fraction. |
+| `campaign.scheduler.warmup_ratio` | fraction [0,1], `.1` | Fraction of optimizer steps spent warming up. |
+| `campaign.scheduler.warmup_min_lr_ratio` | fraction [0,1], `0` | Learning-rate multiplier at the start of warmup. |
 | `campaign.scheduler.cosine_min_ratio` | fraction [0,1], `.05` | Final cosine LR fraction. |
 
 ## 4. Stage-2 BrainOmni settings
@@ -106,7 +107,8 @@ Campaign settings are checkpoint-semantic and are saved in `pretrain_setting.yam
 | `campaign.optimizer.betas` | two fractions [0,1), `[.9,.95]` | AdamW moment coefficients. |
 | `campaign.optimizer.eps` | positive float, `1e-6` | AdamW numerical stabilizer. |
 | `campaign.optimizer.weight_decay` | non-negative float, `.05` | Transformer L2 regularization. |
-| `campaign.scheduler.warmup_ratio` | fraction [0,1], `.1` | Initial warmup fraction. |
+| `campaign.scheduler.warmup_ratio` | fraction [0,1], `.1` | Fraction of optimizer steps spent warming up. |
+| `campaign.scheduler.warmup_min_lr_ratio` | fraction [0,1], `0` | Learning-rate multiplier at the start of warmup. |
 | `campaign.scheduler.cosine_min_ratio` | fraction [0,1], `.1` | Final cosine LR fraction. |
 
 The Stage-2 architecture is defined solely by the four `lm_*` fields, rather

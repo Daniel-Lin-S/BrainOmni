@@ -351,7 +351,11 @@ def validate_pretrain_config(config: dict[str, Any]) -> None:
     _validate_optimizer(campaign["optimizer"], stage)
     scheduler = _mapping(
         campaign["scheduler"],
-        {"warmup_ratio", "cosine_min_ratio"},
+        {
+            "warmup_ratio",
+            "warmup_min_lr_ratio",
+            "cosine_min_ratio",
+        },
         "campaign.scheduler",
     )
     for key, value in scheduler.items():
@@ -839,15 +843,6 @@ def build_deepspeed_config(
             "params": {
                 "betas": campaign["optimizer"]["betas"],
                 "eps": campaign["optimizer"]["eps"],
-            },
-        },
-        "scheduler": {
-            "type": "WarmupCosineLR",
-            "params": {
-                "total_num_steps": None,
-                "warmup_num_steps": None,
-                "warmup_min_ratio": campaign["scheduler"]["warmup_ratio"],
-                "cos_min_ratio": campaign["scheduler"]["cosine_min_ratio"],
             },
         },
         "zero_optimization": {

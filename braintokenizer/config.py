@@ -43,6 +43,12 @@ class BrainTokenizerTrainerConfig:
         self.codebook_lr = optimizer["codebook_lr"]
         self.weight_decay = optimizer["weight_decay"]
         self.scheduler_warm_ratio = campaign["scheduler"]["warmup_ratio"]
+        self.scheduler_warmup_min_lr_ratio = campaign["scheduler"][
+            "warmup_min_lr_ratio"
+        ]
+        self.scheduler_cosine_min_ratio = campaign["scheduler"][
+            "cosine_min_ratio"
+        ]
         self.ds_config, self.gradient_accumulation_steps = (
             build_deepspeed_config(settings, world_size)
         )
