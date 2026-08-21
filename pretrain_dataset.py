@@ -36,6 +36,84 @@ def collate_fn(batch):
     return data
 
 
+def build_fixed_monitor_batch(
+    metadata_path: str,
+    accessor: DataAccessor,
+    rank: int,
+    world_size: int,
+    batch_size: int,
+) -> dict[str, torch.Tensor | list[str]]:
+    """Build one deterministic channel-compatible validation batch per rank.
+
+    Parameters
+    ----------
+    metadata_path : str
+        Directory containing ``val.json`` split metadata.
+    accessor : DataAccessor
+        Read-only processed-tensor accessor.
+    rank : int
+        Distributed rank selecting one deterministic shard.
+    world_size : int
+        Number of distributed ranks.
+    batch_size : int
+        Maximum samples in the fixed per-rank micro-batch.
+
+    Returns
+    -------
+    dict[str, torch.Tensor or list[str]]
+        Collated CPU batch with equal channel counts across samples.
+    """
+    if rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"Expected rank in [0, {world_size}), got {rank}."
+        )
+    if batch_size <= 0:
+        raise ValueError(
+            f"Fixed monitor batch size must be positive, got {batch_size}."
+        )
+    validation_path = os.path.join(metadata_path, "val.json")
+    with open(validation_path, "r", encoding="utf-8") as stream:
+        metadata = json.load(stream)
+    if not isinstance(metadata, list) or not metadata:
+        raise ValueError(
+            f"Validation metadata is empty: {os.path.abspath(validation_path)}."
+        )
+    channel_groups: dict[int, list[dict]] = {}
+    for item in metadata:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "Validation metadata must contain mappings, got "
+                f"{type(item).__name__}."
+            )
+        channels = item.get("channels")
+        path = item.get("path")
+        if not isinstance(channels, int) or channels <= 0:
+            raise ValueError(
+                f"Validation metadata has invalid channel count {channels!r}."
+            )
+        if not isinstance(path, str) or not os.path.isabs(path):
+            raise ValueError(
+                "Validation metadata requires absolute processed paths, got "
+                f"{path!r}."
+            )
+        channel_groups.setdefault(channels, []).append(item)
+    selected = None
+    for channels in sorted(channel_groups):
+        group = sorted(channel_groups[channels], key=lambda item: item["path"])
+        shard = group[rank::world_size]
+        if not shard:
+            shard = group
+        selected = shard[:batch_size]
+        break
+    if not selected:
+        raise ValueError(
+            "Cannot form one fixed validation monitor batch per rank from "
+            f"{os.path.abspath(validation_path)}."
+        )
+    dataset = BrainDataset(selected, accessor)
+    return collate_fn([dataset[index] for index in range(len(dataset))])
+
+
 class Bucket:
     def __init__(self, batch_size):
         self.data = []

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Mapping
 
 from factory.campaign import ensure_campaign_health
@@ -87,6 +86,13 @@ class BrainOmniTrainerConfig:
         ]
         self.checkpoint_interval_epochs = invocation[
             "checkpoint_interval_epochs"
+        ]
+        monitoring = invocation["monitoring"]
+        self.lightweight_monitor_interval_steps = monitoring[
+            "lightweight_interval_steps"
+        ]
+        self.diagnostic_monitor_interval_steps = monitoring[
+            "diagnostic_interval_steps"
         ]
 
     def get_model_cfg(self) -> dict[str, Any]:

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from model_utils.attn import RMSNorm, FeedForward, SelfAttnBlock
+from model_utils.attn import RMSNorm, FeedForward
 from model_utils.seanet import SEANetEncoder, SEANetDecoder
 from model_utils.vq import RVQ
 
@@ -69,11 +69,24 @@ class BackWardSolution(nn.Module):
         self.v = nn.Linear(n_dim, n_dim)
         self.proj = nn.Linear(n_dim, n_dim)
 
-    def forward(self, neuros: torch.Tensor, k: torch.Tensor, x: torch.Tensor):
+    def forward(
+        self,
+        neuros: torch.Tensor,
+        k: torch.Tensor,
+        x: torch.Tensor,
+        return_attention: bool = False,
+    ):
         B, N_q, _ = neuros.shape
         q = rearrange(neuros, "B T (H D) -> B H T D", H=self.n_head)
         k = rearrange(k, "B T (H D) -> B H T D", H=self.n_head)
         v = rearrange(self.v(x), "B T (H D) -> B H T D", H=self.n_head)
+        attention = None
+        if return_attention:
+            scale = q.shape[-1] ** -0.5
+            attention = torch.softmax(
+                (q.float() @ k.float().transpose(-2, -1)) * scale,
+                dim=-1,
+            )
         output = (
             F.scaled_dot_product_attention(
                 query=q, key=k, value=v, dropout_p=self.dropout, is_causal=False
@@ -82,7 +95,10 @@ class BackWardSolution(nn.Module):
             .contiguous()
         )
         output = output.view(B, N_q, -1)
-        return self.proj(output)
+        output = self.proj(output)
+        if return_attention:
+            return output, attention
+        return output
 
 
 # recieve B C (W T) sensor_embedding  -> conv encode -> spatial encode -> time encode -> squeeze to B W (Q D)
@@ -113,7 +129,13 @@ class BrainTokenizerEncoder(nn.Module):
         )
         self.k_proj = nn.Linear(n_dim, n_dim)
 
-    def forward(self, x: torch.Tensor, sensor_embedding: torch.Tensor = None, **kwargs):
+    def forward(
+        self,
+        x: torch.Tensor,
+        sensor_embedding: torch.Tensor | None = None,
+        return_attention: bool = False,
+        **kwargs,
+    ):
         """
         x:                 B C N L(unfolded)    batch channel N_split length
         sensor_embedding   B C D                batch channel neuro_dim
@@ -129,9 +151,26 @@ class BrainTokenizerEncoder(nn.Module):
         )
         x = rearrange(x, "B C W D -> (B W) C D")
         neuros = self.neuros.type_as(x).unsqueeze(0).repeat(x.shape[0], 1, 1)
-        x = self.backwardsolution(neuros, self.k_proj(x + sensor_embedding), x)
+        encoded = self.backwardsolution(
+            neuros,
+            self.k_proj(x + sensor_embedding),
+            x,
+            return_attention=return_attention,
+        )
+        if return_attention:
+            x, attention = encoded
+        else:
+            x = encoded
         x = rearrange(x, "(B N T) C D -> B C (N T) D", B=B, N=N)
-        return rearrange(x, "B C (N T) D -> B C N T D", N=N)
+        x = rearrange(x, "B C (N T) D -> B C N T D", N=N)
+        if return_attention:
+            attention = rearrange(
+                attention,
+                "(B W) H S C -> B W H S C",
+                B=B,
+            )
+            return x, attention
+        return x
 
 
 # recieve B W (Q D) sensor_embedding -> B W (Q D) quantized feature and  num_quantizers B W label
@@ -160,14 +199,25 @@ class BrainQuantizer(nn.Module):
         indices = self.rvq.encode(F.normalize(x, p=2.0, dim=-1))
         return indices
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_monitor_data: bool = False,
+    ):
         """
         x: B W D
         x_q: B W D
         indices: B W num quantizer
         loss: num_quantizer
         """
-        x_q, indices, loss = self.rvq(F.normalize(x, p=2.0, dim=-1))
+        result = self.rvq(
+            F.normalize(x, p=2.0, dim=-1),
+            return_monitor_data=return_monitor_data,
+        )
+        if return_monitor_data:
+            x_q, indices, loss, monitor_data = result
+            return x_q, indices, loss, monitor_data
+        x_q, indices, loss = result
         return x_q, indices, loss
 
 

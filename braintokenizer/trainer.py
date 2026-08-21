@@ -1,8 +1,8 @@
 from pathlib import Path
 import os
-import math
 import torch
 import logging
+from urllib.parse import quote
 import deepspeed
 import matplotlib.pyplot as plt
 import deepspeed.comm as dist
@@ -10,7 +10,10 @@ from tqdm import tqdm
 from einops import rearrange
 from torch.utils.tensorboard import SummaryWriter
 from accessor import DataAccessor
-from pretrain_dataset import build_brain_bucket_dataloader
+from pretrain_dataset import (
+    build_brain_bucket_dataloader,
+    build_fixed_monitor_batch,
+)
 from factory.campaign import (
     CampaignContext,
     export_completed_weights,
@@ -29,15 +32,20 @@ from factory.training_runtime import (
 from braintokenizer.config import BrainTokenizerTrainerConfig
 from braintokenizer.model import BrainTokenizer
 from braintokenizer.metrics import MetricsComputer
-
-
-def batched_bincount(x, num_classes, dim):
-    target = torch.zeros(
-        (list(x.shape[:-1]) + [num_classes]), dtype=x.dtype, device=x.device
-    )
-    values = torch.ones_like(x)
-    target.scatter_add_(dim, x, values)
-    return target
+from factory.pretraining_monitor_runtime import StageOneAccumulator
+from factory.pretraining_monitors import (
+    MONITOR_EPSILON,
+    attention_similarity_statistics,
+    canonical_tag,
+    checked_ratio,
+    distributed_update_to_weight_ratio,
+    level_name,
+    monitor_due,
+    optimizer_step_values,
+    successful_optimizer_steps,
+    write_scalars,
+    zero_partition_snapshot,
+)
 
 
 class EmptyLogger:
@@ -131,6 +139,18 @@ class Trainer:
                     self.epoch,
                     (self.campaign.checkpoint_root / "latest").resolve(),
                 )
+        self.step_monitor = StageOneAccumulator(self.cfg.codebook_size)
+        self.fixed_monitor_batch = None
+        self.codebook_monitor_snapshot = None
+        if self.training_required:
+            self.fixed_monitor_batch = build_fixed_monitor_batch(
+                metadata_path=self.cfg.pretrain_metadata_path,
+                accessor=self.accessor,
+                rank=self.rank,
+                world_size=self.world_size,
+                batch_size=self.cfg.batch_size,
+            )
+            self.codebook_monitor_snapshot = self._codebook_snapshot()
 
     def main(self):
         """Train or reuse the exact campaign, export, and evaluate."""
@@ -262,7 +282,10 @@ class Trainer:
                     self.write_visualize_result(
                         output_dict["x"],
                         output_dict["x_rec"],
-                        tag=mode,
+                        tag=(
+                            "evaluation/visualization/reconstruction/"
+                            f"{quote(mode, safe='._-')}"
+                        ),
                         global_step=index,
                     )
             metrics = self.metrics_computer.get_metrics()
@@ -289,7 +312,12 @@ class Trainer:
         self.logger.info(
             f">>>>>>>>>>>>>>>> Epoch {self.epoch} >>>>>>>>>>>>>>>>"
         )
-        self.eval_running_indices = []
+        self.train_epoch_monitor = StageOneAccumulator(
+            self.cfg.codebook_size
+        )
+        self.validation_epoch_monitor = StageOneAccumulator(
+            self.cfg.codebook_size
+        )
         self.train_running_dict = {
             "loss": 0.0,
             "time_loss": 0.0,
@@ -322,7 +350,9 @@ class Trainer:
         self,
         raw: torch.Tensor,
         rec: torch.Tensor,
-        tag: str = "reconstruction_comparison",
+        tag: str = (
+            "train/micro_step/visualization/reconstruction"
+        ),
         global_step: int = None,
     ):
         raw = raw.detach().cpu().float()
@@ -348,13 +378,50 @@ class Trainer:
 
     def train_step(self):
         input_dict = self.fetch_input_dict()
-        output_dict, _ = self.model(**input_dict)
+        boundary = self.model.is_gradient_accumulation_boundary()
+        successful_before = successful_optimizer_steps(self.model)
+        lightweight_due = monitor_due(
+            self.model,
+            self.cfg.lightweight_monitor_interval_steps,
+            boundary,
+        )
+        diagnostic_due = monitor_due(
+            self.model,
+            self.cfg.diagnostic_monitor_interval_steps,
+            boundary,
+        )
+        learning_rates = self.model.get_lr() if lightweight_due else None
+        weight_snapshot = (
+            zero_partition_snapshot(self.model) if diagnostic_due else None
+        )
+        output_dict, _, monitor_data = self.model(
+            **input_dict,
+            return_monitor_data=True,
+        )
         tqdm_dict = {k: v.item() for k, v in output_dict.items()}
         for key in self.train_running_dict.keys():
             self.train_running_dict[key] += output_dict[key].item()
+        self.step_monitor.update(output_dict, monitor_data)
+        self.train_epoch_monitor.update(output_dict, monitor_data)
         loss = output_dict["loss"]
         self.model.backward(loss)
         self.model.step()
+        if boundary:
+            successful_after = successful_optimizer_steps(self.model)
+            if successful_after > successful_before:
+                if lightweight_due:
+                    self._write_lightweight_monitors(
+                        successful_after,
+                        learning_rates,
+                    )
+                if diagnostic_due:
+                    self._write_diagnostic_monitors(
+                        successful_after,
+                        weight_snapshot,
+                    )
+            self.step_monitor = StageOneAccumulator(
+                self.cfg.codebook_size
+            )
         if self.train_step_counter % self.cfg.visualization_interval_steps == 0:
             self.model.eval()
             output_dict = self.model.visualize(**input_dict)
@@ -370,13 +437,14 @@ class Trainer:
     @torch.no_grad()
     def eval_step(self):
         input_dict = self.fetch_input_dict()
-        output_dict, indices = self.model(**input_dict)
+        output_dict, _, monitor_data = self.model(
+            **input_dict,
+            return_monitor_data=True,
+        )
         tqdm_dict = {k: v.item() for k, v in output_dict.items()}
         for key in self.eval_running_dict.keys():
             self.eval_running_dict[key] += output_dict[key].item()
-        self.eval_running_indices.append(
-            indices.cpu().view(-1, self.cfg.num_quantizers)
-        )
+        self.validation_epoch_monitor.update(output_dict, monitor_data)
         return tqdm_dict
 
     def scalar_comm_reduce(self, scalar, op=dist.ReduceOp.AVG):
@@ -386,46 +454,141 @@ class Trainer:
         dist.all_reduce(tensor_scalar, op=op)
         return tensor_scalar.item()
 
+    def _reduce_sum(self, value: torch.Tensor) -> None:
+        """Sum one monitor sufficient statistic across all ranks."""
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+
+    def _codebook_snapshot(self) -> torch.Tensor:
+        """Return an in-memory snapshot of all effective RVQ codebooks."""
+        return (
+            self.model.module.quantizer.rvq.codebooks
+            .detach()
+            .double()
+            .clone()
+        )
+
+    def _write_lightweight_monitors(
+        self,
+        optimizer_step: int,
+        learning_rates,
+    ) -> None:
+        """Write Stage-1 and optimization scalars at lightweight cadence."""
+        if learning_rates is None:
+            raise RuntimeError(
+                "Learning rates were not captured before the optimizer step."
+            )
+        self.step_monitor.reduce_(self._reduce_sum)
+        values = self.step_monitor.training_values("step")
+        values.update(
+            optimizer_step_values(
+                self.model,
+                learning_rates,
+                ("main", "no_decay", "codebook"),
+            )
+        )
+        if self.rank == 0:
+            write_scalars(self.writer, values, optimizer_step)
+
+    def _write_diagnostic_monitors(
+        self,
+        optimizer_step: int,
+        weight_snapshot: list[torch.Tensor] | None,
+    ) -> None:
+        """Write Stage-1 diagnostics at the configured sparse cadence."""
+        if weight_snapshot is None:
+            raise RuntimeError(
+                "Update-to-weight monitoring has no pre-update snapshot."
+            )
+        update_ratio = distributed_update_to_weight_ratio(
+            weight_snapshot,
+            self.model,
+            self._reduce_sum,
+            self.local_rank,
+        )
+
+        if self.codebook_monitor_snapshot is None:
+            raise RuntimeError(
+                "Codebook monitoring has no previous in-memory snapshot."
+            )
+        current_codebooks = self._codebook_snapshot()
+        codebook_update = torch.sqrt(
+            torch.square(current_codebooks - self.codebook_monitor_snapshot)
+            .sum(dim=(1, 2))
+        )
+        codebook_norm = torch.sqrt(
+            torch.square(self.codebook_monitor_snapshot).sum(dim=(1, 2))
+        )
+        codebook_ratio = codebook_update / (
+            codebook_norm + MONITOR_EPSILON
+        )
+        self.codebook_monitor_snapshot = current_codebooks
+
+        if self.fixed_monitor_batch is None:
+            raise RuntimeError(
+                "Inter-query attention monitoring has no fixed validation "
+                "batch."
+            )
+        fixed_batch = {
+            key: self.fixed_monitor_batch[key].to(
+                device=self.local_rank,
+                non_blocking=True,
+            )
+            for key in ("x", "pos", "sensor_type")
+        }
+        was_training = self.model.training
+        self.model.eval()
+        attention = self.model.module.monitor_attention(**fixed_batch)
+        similarity_sum, similarity_count = (
+            attention_similarity_statistics(attention)
+        )
+        similarity_statistics = torch.stack(
+            (similarity_sum, similarity_count)
+        ).to(device=self.local_rank)
+        self._reduce_sum(similarity_statistics)
+        similarity_mean = checked_ratio(
+            similarity_statistics[0],
+            similarity_statistics[1],
+            "distributed inter-query attention similarity",
+        )
+        if was_training:
+            self.model.train()
+
+        values = {
+            canonical_tag(
+                "train",
+                "step",
+                "optimization",
+                "update_to_weight_ratio",
+                "global",
+            ): update_ratio,
+            canonical_tag(
+                "validation",
+                "step",
+                "latent_source",
+                "inter_query_attention_similarity",
+            ): similarity_mean,
+        }
+        for level in range(codebook_ratio.numel()):
+            values[
+                canonical_tag(
+                    "train",
+                    "step",
+                    "rvq",
+                    "codebook_update_magnitude",
+                    level_name(level),
+                )
+            ] = codebook_ratio[level]
+        if self.rank == 0:
+            write_scalars(self.writer, values, optimizer_step)
+
     def after_epoch(self):
         torch.cuda.empty_cache()
-        indices = (
-            torch.vstack(self.eval_running_indices)
-            .transpose(0, 1)
-            .to(self.local_rank)
-        )
-        codebook_count = batched_bincount(indices, self.cfg.codebook_size, -1)
-        dist.all_reduce(codebook_count, op=dist.ReduceOp.SUM)
-        codebook_count = codebook_count / codebook_count.sum(
-            dim=-1, keepdim=True
-        )
-        codebook_utilize_entropy = -torch.sum(
-            codebook_count * torch.log2(codebook_count + 1e-6), dim=-1
-        )
-        codebook_utilize_entropy /= math.log2(self.cfg.codebook_size)
-        for i in range(self.cfg.num_quantizers):
-            self.writer.add_scalar(
-                tag=f"eval_codebook_utilize_entropy_{i}",
-                scalar_value=codebook_utilize_entropy[i].item(),
-                global_step=self.epoch,
-            )
-
-        self.writer.add_scalar(
-            tag=f"eval_codebook_utilize_entropy_mean",
-            scalar_value=codebook_utilize_entropy.mean().item(),
-            global_step=self.epoch,
-        )
-
         for key in self.train_running_dict.keys():
             self.train_running_dict[key] = self.train_running_dict[key] / len(
                 self.train_loader
             )
             self.train_running_dict[key] = self.scalar_comm_reduce(
                 self.train_running_dict[key]
-            )
-            self.writer.add_scalar(
-                tag=f"train_{key}",
-                scalar_value=self.train_running_dict[key],
-                global_step=self.epoch,
             )
         for key in self.eval_running_dict.keys():
             self.eval_running_dict[key] = self.eval_running_dict[key] / len(
@@ -434,18 +597,23 @@ class Trainer:
             self.eval_running_dict[key] = self.scalar_comm_reduce(
                 self.eval_running_dict[key]
             )
-            self.writer.add_scalar(
-                tag=f"eval_{key}",
-                scalar_value=self.eval_running_dict[key],
-                global_step=self.epoch,
-            )
             self.logger.info(
                 f"train {key}:{self.train_running_dict[key]} "
                 f"eval {key}:{self.eval_running_dict[key]}"
             )
-        self.logger.info(
-            f"code utilize entropy:{codebook_utilize_entropy.cpu()}"
-        )
+        self.train_epoch_monitor.reduce_(self._reduce_sum)
+        self.validation_epoch_monitor.reduce_(self._reduce_sum)
+        if self.rank == 0:
+            write_scalars(
+                self.writer,
+                self.train_epoch_monitor.training_values("epoch"),
+                self.epoch,
+            )
+            write_scalars(
+                self.writer,
+                self.validation_epoch_monitor.validation_values(),
+                self.epoch,
+            )
         self.logger.info("")
 
         if self.eval_running_dict["judge_loss"] < self.best_eval_loss:

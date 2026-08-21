@@ -90,6 +90,8 @@ When incorporating a new dataset, place its custom montage file (if applicable) 
 Pre-training is configured only through the tracked YAML defaults and ignored
 local overlays. See [the configuration reference](docs/pretraining_configuration.md)
 for the schema, layered launch syntax, and artifact contract.
+[Training monitors](docs/pretraining_monitors.md) documents TensorBoard tags,
+cadence, and on-demand scalar extraction for custom visualizations.
 
 A successful Stage-1 run writes `BrainTokenizer.pt` automatically beside
 `model_cfg.json`; use that run directory as the Stage-2 tokenizer artifact.

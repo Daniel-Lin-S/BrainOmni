@@ -55,6 +55,9 @@ invocation:
   held_out_evaluation_datasets: []
   checkpoint_interval_epochs: 20
   visualization_interval_steps: 200
+  monitoring:
+    lightweight_interval_steps: 100
+    diagnostic_interval_steps: 500
   deepspeed:
     bf16:
       enabled: true

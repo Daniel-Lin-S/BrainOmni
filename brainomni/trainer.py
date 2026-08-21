@@ -25,6 +25,17 @@ from factory.training_runtime import (
     save_distributed_checkpoint,
     write_evaluation_metrics,
 )
+from factory.pretraining_monitor_runtime import StageTwoAccumulator
+from factory.pretraining_monitors import (
+    canonical_tag,
+    distributed_update_to_weight_ratio,
+    modality_channel_groups,
+    monitor_due,
+    optimizer_step_values,
+    successful_optimizer_steps,
+    write_scalars,
+    zero_partition_snapshot,
+)
 
 
 class EmptyLogger:
@@ -117,6 +128,7 @@ class Trainer:
                     self.epoch,
                     (self.campaign.checkpoint_root / "latest").resolve(),
                 )
+        self.step_monitor = StageTwoAccumulator()
 
     def main(self):
         """Train or reuse the exact campaign, export, and evaluate."""
@@ -270,6 +282,8 @@ class Trainer:
         for i in range(self.cfg.num_quantizers_used):
             self.train_running_dict[f"acc_{i}"] = 0.0
             self.eval_running_dict[f"acc_{i}"] = 0.0
+        self.train_epoch_monitor = StageTwoAccumulator()
+        self.validation_epoch_monitor = StageTwoAccumulator()
 
     def fetch_input_dict(self):
         input_dict = self.input_dict
@@ -282,23 +296,63 @@ class Trainer:
 
     def train_step(self):
         input_dict = self.fetch_input_dict()
-        output_dict = self.model(**input_dict)
+        boundary = self.model.is_gradient_accumulation_boundary()
+        successful_before = successful_optimizer_steps(self.model)
+        lightweight_due = monitor_due(
+            self.model,
+            self.cfg.lightweight_monitor_interval_steps,
+            boundary,
+        )
+        diagnostic_due = monitor_due(
+            self.model,
+            self.cfg.diagnostic_monitor_interval_steps,
+            boundary,
+        )
+        learning_rates = self.model.get_lr() if lightweight_due else None
+        weight_snapshot = (
+            zero_partition_snapshot(self.model) if diagnostic_due else None
+        )
+        output_dict, monitor_data = self.model(
+            **input_dict,
+            return_monitor_data=True,
+        )
         tqdm_dict = {k: v.item() for k, v in output_dict.items()}
         for key in self.train_running_dict.keys():
             self.train_running_dict[key] += output_dict[key].item()
+        self.step_monitor.update(output_dict, monitor_data)
+        self.train_epoch_monitor.update(output_dict, monitor_data)
         loss = output_dict["loss"]
         self.model.backward(loss)
         self.model.step()
+        if boundary:
+            successful_after = successful_optimizer_steps(self.model)
+            if successful_after > successful_before:
+                if lightweight_due:
+                    self._write_lightweight_monitors(
+                        successful_after,
+                        learning_rates,
+                    )
+                if diagnostic_due:
+                    self._write_diagnostic_monitors(
+                        successful_after,
+                        weight_snapshot,
+                    )
+            self.step_monitor = StageTwoAccumulator()
         self.train_step_counter += 1
         return tqdm_dict
 
     @torch.no_grad()
     def eval_step(self):
         input_dict = self.fetch_input_dict()
-        output_dict = self.model(**input_dict)
+        output_dict, monitor_data = self.model(
+            **input_dict,
+            return_monitor_data=True,
+        )
         tqdm_dict = {k: v.item() for k, v in output_dict.items()}
         for key in self.eval_running_dict.keys():
             self.eval_running_dict[key] += output_dict[key].item()
+        self.validation_epoch_monitor.update(output_dict, monitor_data)
+        self._update_modality_validation(input_dict)
         return tqdm_dict
 
     def scalar_comm_reduce(self, scalar, op=dist.ReduceOp.AVG):
@@ -307,6 +361,89 @@ class Trainer:
         )
         dist.all_reduce(tensor_scalar, op=op)
         return tensor_scalar.item()
+
+    def _reduce_sum(self, value: torch.Tensor) -> None:
+        """Sum one monitor sufficient statistic across all ranks."""
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+
+    @torch.no_grad()
+    def _update_modality_validation(self, input_dict) -> None:
+        """Evaluate EEG and MEG channel subsets, including mixed EMEG."""
+        sensor_type = input_dict["sensor_type"]
+        for name, groups in modality_channel_groups(sensor_type).items():
+            for sample_tensor, channel_mask in groups:
+                modality_input = {
+                    "x": input_dict["x"].index_select(
+                        0,
+                        sample_tensor,
+                    )[:, channel_mask],
+                    "pos": input_dict["pos"].index_select(
+                        0,
+                        sample_tensor,
+                    )[:, channel_mask],
+                    "sensor_type": sensor_type.index_select(
+                        0,
+                        sample_tensor,
+                    )[:, channel_mask],
+                }
+                _, monitor_data = self.model(
+                    **modality_input,
+                    return_monitor_data=True,
+                )
+                self.validation_epoch_monitor.add_modality(
+                    name,
+                    monitor_data,
+                )
+
+    def _write_lightweight_monitors(
+        self,
+        optimizer_step: int,
+        learning_rates,
+    ) -> None:
+        """Write Stage-2 and optimization scalars at lightweight cadence."""
+        if learning_rates is None:
+            raise RuntimeError(
+                "Learning rates were not captured before the optimizer step."
+            )
+        self.step_monitor.reduce_(self._reduce_sum)
+        values = self.step_monitor.training_values("step")
+        values.update(
+            optimizer_step_values(
+                self.model,
+                learning_rates,
+                ("main", "no_decay"),
+            )
+        )
+        if self.rank == 0:
+            write_scalars(self.writer, values, optimizer_step)
+
+    def _write_diagnostic_monitors(
+        self,
+        optimizer_step: int,
+        weight_snapshot: list[torch.Tensor] | None,
+    ) -> None:
+        """Write the Stage-2 update-to-weight diagnostic."""
+        if weight_snapshot is None:
+            raise RuntimeError(
+                "Update-to-weight monitoring has no pre-update snapshot."
+            )
+        update_ratio = distributed_update_to_weight_ratio(
+            weight_snapshot,
+            self.model,
+            self._reduce_sum,
+            self.local_rank,
+        )
+        values = {
+            canonical_tag(
+                "train",
+                "step",
+                "optimization",
+                "update_to_weight_ratio",
+                "global",
+            ): update_ratio,
+        }
+        if self.rank == 0:
+            write_scalars(self.writer, values, optimizer_step)
 
     def after_epoch(self):
         torch.cuda.empty_cache()
@@ -317,11 +454,6 @@ class Trainer:
             self.train_running_dict[key] = self.scalar_comm_reduce(
                 self.train_running_dict[key]
             )
-            self.writer.add_scalar(
-                tag=f"train_{key}",
-                scalar_value=self.train_running_dict[key],
-                global_step=self.epoch,
-            )
         for key in self.eval_running_dict.keys():
             self.eval_running_dict[key] = self.eval_running_dict[key] / len(
                 self.val_loader
@@ -329,16 +461,24 @@ class Trainer:
             self.eval_running_dict[key] = self.scalar_comm_reduce(
                 self.eval_running_dict[key]
             )
-            self.writer.add_scalar(
-                tag=f"eval_{key}",
-                scalar_value=self.eval_running_dict[key],
-                global_step=self.epoch,
-            )
             self.logger.info(
                 f"train {key}:{self.train_running_dict[key]} "
                 f"eval {key}:{self.eval_running_dict[key]}"
             )
 
+        self.train_epoch_monitor.reduce_(self._reduce_sum)
+        self.validation_epoch_monitor.reduce_(self._reduce_sum)
+        if self.rank == 0:
+            write_scalars(
+                self.writer,
+                self.train_epoch_monitor.training_values("epoch"),
+                self.epoch,
+            )
+            write_scalars(
+                self.writer,
+                self.validation_epoch_monitor.validation_values(),
+                self.epoch,
+            )
         self.logger.info("")
         if self.eval_running_dict["loss"] < self.best_eval_loss:
             self.best_eval_loss = self.eval_running_dict["loss"]

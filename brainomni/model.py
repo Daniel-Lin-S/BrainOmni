@@ -1,10 +1,12 @@
 import torch
-from typing import List, Dict
+from typing import List
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from braintokenizer.model import BrainTokenizer
-from model_utils.attn import SelfAttnBlock, RMSNorm, SpatialTemporalAttentionBlock
+from model_utils.attn import RMSNorm, SpatialTemporalAttentionBlock
+
+DEDICATED_MASK_PROBABILITY = 0.8
 
 
 class BrainOmni(nn.Module):
@@ -207,8 +209,9 @@ class BrainOmni(nn.Module):
         x: torch.Tensor,
         pos: torch.Tensor,
         sensor_type: torch.Tensor,
+        return_monitor_data: bool = False,
         **kwargs,
-    ) -> Dict[str, torch.Tensor]:
+    ):
         """
         Forward pass for pre-training using masked modeling.
 
@@ -221,13 +224,18 @@ class BrainOmni(nn.Module):
             2 sets of Cartesian coordinates, 3 for location, 3 for orientation.
         sensor_type : torch.Tensor
             Sensor type indicators of shape (Batch, Channels).
+        return_monitor_data : bool, optional
+            Return transient sufficient statistics, by default False.
         **kwargs
             Additional arguments.
 
         Returns
         -------
-        Dict[str, torch.Tensor]
-            Dictionary containing the total loss and accuracies for each quantizer level.
+        dict[str, torch.Tensor]
+            Dictionary containing total loss and per-level accuracies.
+        dict[str, torch.Tensor], optional
+            Monitoring payload returned only when ``return_monitor_data`` is
+            True. The default dictionary return contract is unchanged.
         """
         x, label_indices = self.tokenizer.tokenize(
             x, pos, sensor_type, self.overlap_ratio
@@ -250,10 +258,13 @@ class BrainOmni(nn.Module):
             ),
         )
         # 80% use mask token
-        tmp_mask = (mask.float() + torch.rand(size=(B, C, W), device=x.device)) > 0.8
-        tmp_mask = tmp_mask.unsqueeze(-1).type_as(x)
+        tmp_mask = (
+            mask.float() + torch.rand(size=(B, C, W), device=x.device)
+        ) > DEDICATED_MASK_PROBABILITY
+        random_replacement_mask = ~mask & tmp_mask
+        tmp_mask_values = tmp_mask.unsqueeze(-1).type_as(x)
         mask_token = self.mask_token.type_as(x)
-        x = x * tmp_mask + mask_token * (1 - tmp_mask)
+        x = x * tmp_mask_values + mask_token * (1 - tmp_mask_values)
 
         neuro = self.tokenizer.encoder.neuros.type_as(x).detach().view(1, C, 1, -1)
         x = x + neuro
@@ -269,11 +280,87 @@ class BrainOmni(nn.Module):
             "B C W (N D) -> B C W N D",
             N=self.num_quantizers_used,
         )
-        loss, acc = self._compute_cross_entropy(logits, label_indices, mask)
+        if return_monitor_data:
+            loss, acc, token_loss, correct = self._compute_cross_entropy(
+                logits,
+                label_indices,
+                mask,
+                return_details=True,
+            )
+        else:
+            loss, acc = self._compute_cross_entropy(
+                logits,
+                label_indices,
+                mask,
+            )
         output_dict = {"loss": loss, "acc_all": acc.mean()}
         for i in range(self.num_quantizers_used):
             output_dict[f"acc_{i}"] = acc[i]
+        if return_monitor_data:
+            monitor_data = self._monitor_statistics(
+                token_loss,
+                correct,
+                label_indices[..., : self.num_quantizers_used],
+                ~mask,
+                random_replacement_mask,
+            )
+            return output_dict, monitor_data
         return output_dict
+
+    def _monitor_statistics(
+        self,
+        token_loss: torch.Tensor,
+        correct: torch.Tensor,
+        labels: torch.Tensor,
+        selected_mask: torch.Tensor,
+        random_replacement_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return masked-token sufficient statistics for monitoring."""
+        level_count = token_loss.shape[-1]
+        selected_loss = token_loss[selected_mask]
+        selected_correct = correct[selected_mask]
+        selected_labels = labels[selected_mask]
+        selected_count = selected_mask.sum().double()
+        if selected_count <= 0:
+            raise ValueError(
+                "Masked-token monitoring found no masked positions."
+            )
+        label_counts = []
+        for level in range(level_count):
+            label_counts.append(
+                torch.bincount(
+                    selected_labels[:, level],
+                    minlength=self.predict_head.out_features // level_count,
+                )
+            )
+
+        dedicated_mask = selected_mask & ~random_replacement_mask
+        corruption_masks = (dedicated_mask, random_replacement_mask)
+        corruption_loss_sums = []
+        corruption_counts = []
+        for corruption_mask in corruption_masks:
+            corruption_loss_sums.append(
+                token_loss[corruption_mask].double().sum(dim=0)
+            )
+            corruption_counts.append(corruption_mask.sum().double())
+
+        source_loss_sum = (
+            token_loss.double()
+            * selected_mask.unsqueeze(-1)
+        ).sum(dim=(0, 2)).transpose(0, 1)
+        source_count = selected_mask.sum(dim=(0, 2)).double()
+        return {
+            "cross_entropy_sum": selected_loss.double().sum(dim=0),
+            "correct_sum": selected_correct.double().sum(dim=0),
+            "masked_count": selected_count,
+            "label_counts": torch.stack(label_counts).double(),
+            "corruption_cross_entropy_sum": torch.stack(
+                corruption_loss_sums
+            ),
+            "corruption_count": torch.stack(corruption_counts),
+            "source_cross_entropy_sum": source_loss_sum,
+            "source_count": source_count,
+        }
 
     def encode(
             self, x: torch.Tensor, pos: torch.Tensor, sensor_type: torch.Tensor
@@ -320,7 +407,11 @@ class BrainOmni(nn.Module):
         )
 
     def _compute_cross_entropy(
-        self, logits: torch.Tensor, label: torch.Tensor, mask: torch.Tensor
+        self,
+        logits: torch.Tensor,
+        label: torch.Tensor,
+        mask: torch.Tensor,
+        return_details: bool = False,
     ):
         """
         Compute cross-entropy loss for masked tokens and calculate level-wise accuracy.
@@ -340,19 +431,50 @@ class BrainOmni(nn.Module):
         Tuple[torch.Tensor, torch.Tensor]
             A tuple containing (mean cross-entropy loss, level-wise accuracy tensor).
         """
-        B, C, W, N = label.shape
-        logits = logits[~mask]
-        label = label[~mask]
-        #  X is masked num , N is codebook depth, M is codebook size
-        logits = rearrange(logits, "X N M -> (X N) M")
-        label = label.view(-1)
+        if not return_details:
+            level_count = label.shape[-1]
+            selected_logits = logits[~mask]
+            selected_label = label[~mask]
+            selected_logits = rearrange(
+                selected_logits,
+                "X N M -> (X N) M",
+            )
+            selected_label = selected_label.view(-1)
+            if selected_label.numel() == 0:
+                raise ValueError(
+                    "Masked-token objective requires at least one masked "
+                    "position."
+                )
+            loss = F.cross_entropy(
+                selected_logits.float(),
+                selected_label,
+                reduction="mean",
+            )
+            accuracy = rearrange(
+                selected_logits.argmax(dim=-1) == selected_label,
+                "(X N) -> N X",
+                N=level_count,
+            ).float().mean(dim=-1)
+            return loss, accuracy
 
-        loss = F.cross_entropy(logits.float(), label, reduction="mean")
-
-        acc = (
-            rearrange((logits.argmax(dim=-1)) == label, "(X N) -> N X", N=N)
-            .float()
-            .mean(dim=-1)
-        )
-
+        level_count = logits.shape[-2]
+        label = label[..., :level_count]
+        flat_logits = rearrange(logits, "B C W N M -> (B C W N) M")
+        flat_label = rearrange(label, "B C W N -> (B C W N)")
+        token_loss = F.cross_entropy(
+            flat_logits.float(),
+            flat_label,
+            reduction="none",
+        ).view(*label.shape)
+        correct = logits.argmax(dim=-1) == label
+        selected_loss = token_loss[~mask]
+        selected_correct = correct[~mask]
+        if selected_loss.numel() == 0:
+            raise ValueError(
+                "Masked-token objective requires at least one masked position."
+            )
+        loss = selected_loss.mean()
+        acc = selected_correct.float().mean(dim=0)
+        if return_details:
+            return loss, acc, token_loss, correct
         return loss, acc

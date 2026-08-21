@@ -1,5 +1,62 @@
 # BrainOmni Training Monitors
 
+## Stored format and tag grammar
+
+Training writes scalar summaries to the existing attempt-specific TensorBoard
+directory. Scalar tags written by new runs use
+`<split>/<cadence>/<family>/<metric>[/<dimension>]`, where split is `train`,
+`validation`, or `evaluation`, and cadence is `step`, `epoch`, or
+`micro_step`. Indexed dimensions are zero padded, for example `level_00` and
+`source_00`. Historical event files are not changed; the extraction interface
+maps their flat tags to this grammar at read time.
+
+Only scalar sufficient statistics and the existing reconstruction figures are
+persisted. Activations, attention matrices, code assignments, optimizer
+partitions, and parameter snapshots exist only transiently in memory.
+Training reconstruction figures use
+`train/micro_step/visualization/reconstruction`; final figures use
+`evaluation/visualization/reconstruction/<encoded-dataset>`.
+
+Cadenced steps count successful DeepSpeed optimizer updates. Gradient
+accumulation micro-batches and skipped updates do not advance that count.
+The defaults are configured under `invocation.monitoring` and are saved in the
+attempt's `invocation.yaml`; they do not affect campaign identity.
+
+## Extracting scalar events
+
+Export one or more campaign or TensorBoard directories to long-form CSV only
+when needed:
+
+```bash
+python -m script.export_pretraining_monitors \
+  --event-dir /absolute/path/to/campaign-a \
+  --event-dir /absolute/path/to/campaign-b \
+  --output /absolute/path/to/monitors.csv
+```
+
+Python callers can use
+`factory.pretraining_monitor_events.load_monitor_events` directly. It returns
+rows with the run, original and normalized tags, tag components, optimizer or
+epoch step, wall time, and scalar value. It recursively discovers event files,
+and prefers a legacy `loss` event over a same-step `judge_loss` alias.
+
+For fully custom plotting, TensorBoard's API is also straightforward:
+
+```python
+from tensorboard.backend.event_processing.event_accumulator import (
+    EventAccumulator,
+)
+
+events = EventAccumulator(
+    "/absolute/path/to/events.out.tfevents.example",
+    size_guidance={"scalars": 0},
+)
+events.Reload()
+points = events.Scalars("train/step/objective/optimized_loss")
+steps = [point.step for point in points]
+values = [point.value for point in points]
+```
+
 ## Cadence conventions
 
 The tables use explicit recommended cadences, however the exact interval should be configurable.
@@ -171,5 +228,10 @@ Stage-2 learning is monitored primarily through masked-token prediction.
 | **Performance by latent-source index** | Detect specific latent-source token streams that remain systematically easier or harder to model | For source index \(s\), compute \(CE_{l,s}\) using only masked positions belonging to source \(s\) | Validation: once per epoch | Low |
 
 Again, for EEG-only or MEG-only pretraining, EEG-vs-MEG masked-token performance doesn't need to be reported.
+
+Stage-2 predictions are indexed by latent source rather than original sensor
+channel. The modality stratification therefore re-tokenizes EEG and MEG sensor
+subsets separately; a mixed EMEG sample contributes to both strata. The
+latent-source stratification uses the original joint forward pass.
 
 The unigram and majority-token comparisons are particularly important for interpreting differences between RVQ levels: higher raw accuracy for one codebook does not necessarily imply that its tokens contain more predictable contextual structure if its marginal token distribution is also substantially more imbalanced.

@@ -164,7 +164,11 @@ class SimVQ(nn.Module):
         x = self.code_transform_linear(x)
         return x + self.code_transform_residual(x)
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_monitor_data: bool = False,
+    ):
         """
         x B ... D
         """
@@ -178,6 +182,8 @@ class SimVQ(nn.Module):
             indices = dist.argmin(dim=-1)  # B *
         # select codes
         quantized = get_at("[c] d, b n -> b n d", implicit_codebook, indices)
+        if return_monitor_data:
+            selected_code = quantized.detach()
 
         # commit loss and straight through, as was done in the paper
         commit_loss = (
@@ -199,6 +205,9 @@ class SimVQ(nn.Module):
         quantized = inverse_pack(quantized)
         indices = inverse_pack(indices, "b *")
 
+        if return_monitor_data:
+            selected_code = inverse_pack(selected_code)
+            return quantized, indices, commit_loss, selected_code
         return quantized, indices, commit_loss
 
     def encode(self, x: torch.Tensor):
@@ -405,10 +414,16 @@ class VectorQuantization(nn.Module):
         quantize = self.project_out(quantize)
         return quantize
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_monitor_data: bool = False,
+    ):
         input_dtype = x.dtype
         x = self.project_in(x)
         quantize, embed_ind = self._codebook(x)
+        if return_monitor_data:
+            selected_code = quantize.detach()
         if self.training:
             if self.rotation_trick:
                 quantize = rotate_to(x, quantize).to(input_dtype)
@@ -420,6 +435,9 @@ class VectorQuantization(nn.Module):
             loss = loss.detach()
 
         quantize = self.project_out(quantize)
+        if return_monitor_data:
+            selected_code = self.project_out(selected_code)
+            return quantize, embed_ind, loss, selected_code
         return quantize, embed_ind, loss
 
 
@@ -475,7 +493,11 @@ class RVQ(nn.Module):
         codebooks = torch.stack(codebooks)
         return codebooks
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_monitor_data: bool = False,
+    ):
         num_quant, quant_dropout_multiple_of, device = (
             self.num_quantizers,
             self.quantize_dropout_multiple_of,
@@ -487,6 +509,10 @@ class RVQ(nn.Module):
 
         all_losses = []
         all_indices = []
+        quantization_error_sums = []
+        quantization_counts = []
+        residual_input_energy_sums = []
+        residual_output_energy_sums = []
 
         should_quantize_dropout = self.training and self.quantize_dropout
 
@@ -526,10 +552,36 @@ class RVQ(nn.Module):
 
             # sim vq forward
 
-            quantized, indices, loss = vq(residual)
+            residual_input = residual
+            if return_monitor_data:
+                quantized, indices, loss, selected_code = vq(
+                    residual,
+                    return_monitor_data=True,
+                )
+            else:
+                quantized, indices, loss = vq(residual)
 
             residual = residual - quantized.detach()
             quantized_out = quantized_out + quantized
+
+            if return_monitor_data:
+                difference = residual_input.double() - selected_code.double()
+                quantization_error_sums.append(
+                    torch.square(difference).sum()
+                )
+                quantization_counts.append(
+                    torch.tensor(
+                        difference.numel() // difference.shape[-1],
+                        dtype=torch.float64,
+                        device=difference.device,
+                    )
+                )
+                residual_input_energy_sums.append(
+                    torch.square(residual_input.double()).sum()
+                )
+                residual_output_energy_sums.append(
+                    torch.square(residual.double()).sum()
+                )
 
             all_losses.append(loss)
             all_indices.append(indices)
@@ -538,6 +590,25 @@ class RVQ(nn.Module):
         all_losses = torch.stack(all_losses, dim=-1)
         all_indices = torch.stack(all_indices, dim=-1)
 
+        if return_monitor_data:
+            monitor_data = {
+                "quantization_error_sum": torch.stack(
+                    quantization_error_sums
+                ),
+                "quantization_count": torch.stack(quantization_counts),
+                "residual_input_energy_sum": torch.stack(
+                    residual_input_energy_sums
+                ),
+                "residual_output_energy_sum": torch.stack(
+                    residual_output_energy_sums
+                ),
+            }
+            return (
+                quantized_out,
+                all_indices,
+                all_losses.mean(),
+                monitor_data,
+            )
         return quantized_out, all_indices, all_losses.mean()
 
     def encode(self, x: torch.Tensor):

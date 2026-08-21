@@ -376,6 +376,77 @@ class CampaignHealthTest(unittest.TestCase):
             self.assertNotEqual(first.root, second.root)
             self.assertFalse(second.checkpoint_root.joinpath("latest").exists())
 
+    def test_monitoring_intervals_do_not_change_campaign_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            overlay = root / "local.yaml"
+            raw = root / "raw"
+            raw.mkdir()
+            invocation = {
+                "data_catalog": {
+                    "dataset": {
+                        "path": str(raw),
+                        "signal_type": "eeg",
+                    }
+                },
+                "metadata_root": str(root / "metadata"),
+                "output_root": str(root / "output"),
+                "processed_root": str(root / "processed"),
+            }
+            overlay.write_text(
+                yaml.safe_dump({"invocation": invocation}),
+                encoding="utf-8",
+            )
+            config = load_pretrain_config(
+                [
+                    ROOT / "configs/pretrain/braintokenizer.yaml",
+                    overlay,
+                ]
+            )
+            metadata = metadata_directory(config)
+            metadata.mkdir(parents=True)
+            row = {"dataset": "dataset", "path": "portable-id"}
+            for partition in ("train", "val", "test"):
+                (metadata / f"{partition}.json").write_text(
+                    json.dumps([row]),
+                    encoding="utf-8",
+                )
+            config["campaign"]["data"]["included_datasets"] = [
+                "dataset"
+            ]
+            with mock.patch.dict(
+                "os.environ",
+                {"BRAINOMNI_ATTEMPT_ID": "monitor-default"},
+            ):
+                first = prepare_campaign(
+                    config,
+                    config["campaign"]["model"],
+                )
+            changed = deepcopy(config)
+            changed["invocation"]["monitoring"] = {
+                "lightweight_interval_steps": 7,
+                "diagnostic_interval_steps": 11,
+            }
+            with mock.patch.dict(
+                "os.environ",
+                {"BRAINOMNI_ATTEMPT_ID": "monitor-override"},
+            ):
+                second = prepare_campaign(
+                    changed,
+                    changed["campaign"]["model"],
+                )
+            self.assertEqual(first.root, second.root)
+            invocation_path = (
+                second.attempt_root / "invocation.yaml"
+            )
+            saved = yaml.safe_load(invocation_path.read_text())
+            self.assertEqual(
+                saved["invocation"]["monitoring"],
+                changed["invocation"]["monitoring"],
+            )
+
     def test_downstream_loader_health_checks_campaign_root(self) -> None:
         class FakeTokenizer:
             def parameters(self) -> list[torch.Tensor]:

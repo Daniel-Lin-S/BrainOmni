@@ -133,6 +133,8 @@ inside the current attempt's `invocation.yaml`.
 | `invocation.held_out_evaluation_datasets` | dataset list, `[]` | Catalog datasets excluded from training and evaluated after completion. |
 | `invocation.checkpoint_interval_epochs` | positive integer, `20` | Retained epoch-checkpoint interval. |
 | `invocation.visualization_interval_steps` | positive integer, `200` (Stage 1) | Reconstruction visualization interval. |
+| `invocation.monitoring.lightweight_interval_steps` | positive integer, `100` | Successful optimizer-update interval for lightweight scalar monitors. |
+| `invocation.monitoring.diagnostic_interval_steps` | positive integer, `500` | Successful optimizer-update interval for sparse diagnostics. |
 | `invocation.deepspeed.bf16.enabled` | boolean, `true` | Enables bfloat16 runtime. |
 | `invocation.deepspeed.bf16.auto_cast` | boolean, `true` | Enables automatic bfloat16 casting. |
 | `invocation.deepspeed.bf16.loss_scale` | float, `0` | Dynamic loss-scale control. |

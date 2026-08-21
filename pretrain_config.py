@@ -44,7 +44,12 @@ BASE_INVOCATION = {
     "preprocess_workers",
     "held_out_evaluation_datasets",
     "checkpoint_interval_epochs",
+    "monitoring",
     "deepspeed",
+}
+MONITORING_KEYS = {
+    "lightweight_interval_steps",
+    "diagnostic_interval_steps",
 }
 DEEPSPEED_KEYS = {"bf16", "zero_optimization"}
 BF16_KEYS = {
@@ -579,6 +584,13 @@ def _validate_invocation(invocation: Any, stage: str) -> None:
         "checkpoint_interval_epochs",
     ):
         _integer(values[key], f"invocation.{key}", 1)
+    monitoring = _mapping(
+        values["monitoring"],
+        MONITORING_KEYS,
+        "invocation.monitoring",
+    )
+    for key, value in monitoring.items():
+        _integer(value, f"invocation.monitoring.{key}", 1)
     held_out = values["held_out_evaluation_datasets"]
     if not isinstance(held_out, list):
         raise ConfigError(

@@ -32,7 +32,6 @@ from pretrain_config import (
     load_data_catalog,
     load_pretrain_config,
     load_pretrain_launch_config,
-    metadata_directory,
     preprocessing_directory,
     resolve_dataset_identities,
     selected_data_catalog,
@@ -120,6 +119,13 @@ class PretrainConfigTest(unittest.TestCase):
             json_path.write_text(json.dumps(config))
             json_config = load_pretrain_config(json_path)
         self.assertEqual(json_config, config)
+        self.assertEqual(
+            config["invocation"]["monitoring"],
+            {
+                "lightweight_interval_steps": 100,
+                "diagnostic_interval_steps": 500,
+            },
+        )
         self.assertEqual(accumulation, 4)
         with self.assertRaises(ConfigError):
             build_deepspeed_config(config, world_size=3)
@@ -177,6 +183,12 @@ class PretrainConfigTest(unittest.TestCase):
             non_integer["campaign"]["training"]["epochs"] = 1.5
             with self.assertRaises(ConfigError):
                 validate_pretrain_config(non_integer)
+            invalid_monitor = deepcopy(config)
+            invalid_monitor["invocation"]["monitoring"][
+                "diagnostic_interval_steps"
+            ] = 0
+            with self.assertRaises(ConfigError):
+                validate_pretrain_config(invalid_monitor)
 
     def test_data_catalog_loading_and_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

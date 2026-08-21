@@ -99,3 +99,12 @@ The preprocessing identity excludes local paths. The split identity includes
 training dataset IDs and signal types, seed, and split ratios, but excludes the
 invocation-only held-out list. Adding held-out evaluations therefore reuses the
 same training splits without admitting those datasets into training.
+
+## Monitoring artifacts
+
+Each attempt's `tensorboard/` directory contains the monitoring record. New
+scalar tags follow
+`<split>/<cadence>/<family>/<metric>[/<dimension>]`.
+
+The training workflow does not create monitor CSV files. It stores only
+TensorBoard scalars and the existing reconstruction figures. Use the on-demand exporter `script/export_pretraining_monitors.py` when a tabular input (csv) is useful for another visualisation tool.

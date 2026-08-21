@@ -48,6 +48,9 @@ invocation:
   preprocess_workers: 32
   held_out_evaluation_datasets: []
   checkpoint_interval_epochs: 20
+  monitoring:
+    lightweight_interval_steps: 100
+    diagnostic_interval_steps: 500
   deepspeed:
     bf16:
       enabled: true

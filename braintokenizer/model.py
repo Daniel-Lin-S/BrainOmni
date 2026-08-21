@@ -162,7 +162,12 @@ class BrainTokenizer(nn.Module):
         return x
 
     def forward(
-        self, x: torch.Tensor, pos: torch.Tensor, sensor_type: torch.Tensor, **kwargs
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        sensor_type: torch.Tensor,
+        return_monitor_data: bool = False,
+        **kwargs,
     ):
         """
         Forward pass for training the VQ-VAE.
@@ -175,23 +180,28 @@ class BrainTokenizer(nn.Module):
             Sensor coordinates and orientations of shape (Batch, Channels, 6).
         sensor_type : torch.Tensor
             Sensor category indices of shape (Batch, Channels).
+        return_monitor_data : bool, optional
+            Return transient sufficient-statistic inputs, by default False.
         **kwargs
             Additional arguments.
 
         Returns
         -------
-        Dict[str, torch.Tensor]
-            TThe optimisation metrics:
+        dict[str, torch.Tensor]
+            The optimisation metrics:
             - loss: Total weighted loss for backpropagation.
-            - time_loss: Temporal reconstruction MSE.
+            - time_loss: Temporal reconstruction L1 loss.
             - pcc: Waveform correlation coefficient.
             - amp_loss: Frequency domain amplitude match.
             - phase_loss: Frequency domain phase match.
             - commitment_loss: RVQ codebook stability loss.
             - judge_loss: Detached total loss for performance monitoring.
         torch.Tensor
-            Discrete codebook indices of shape (Batch, Channels, Window, num_quantizers).
-            num_quantizers - number of quantizers used in the model.
+            Discrete indices with shape
+            (Batch, Channels, Window, num_quantizers).
+        dict[str, torch.Tensor], optional
+            Monitoring payload returned only when ``return_monitor_data`` is
+            True. The default two-element return contract is unchanged.
         """
         x = self.unfold(x)
 
@@ -200,12 +210,18 @@ class BrainTokenizer(nn.Module):
         x = x.index_select(dim=1, index=random_index)
         sensor_embedding = sensor_embedding.index_select(dim=1, index=random_index)
         n_mask_channel = max(int(x.shape[1] * self.mask_ratio), 1)
-        feature = self.encoder(
+        source_latent = self.encoder(
             self.add_noise(x[:, n_mask_channel:]),
             sensor_embedding[:, n_mask_channel:],
         )
 
-        feature, indices, commitment_loss = self.quantizer(feature)
+        if return_monitor_data:
+            feature, indices, commitment_loss, rvq_monitor = self.quantizer(
+                source_latent,
+                return_monitor_data=True,
+            )
+        else:
+            feature, indices, commitment_loss = self.quantizer(source_latent)
 
         x_rec = self.decoder(feature, sensor_embedding)
 
@@ -215,7 +231,7 @@ class BrainTokenizer(nn.Module):
         time_loss = get_time_loss(x_rec, x)
         pcc = get_pcc(x_rec, x)
         amp_loss, phase_loss = get_frequency_domain_loss(x_rec, x)
-        return {
+        output = {
             "loss": time_loss
             + torch.exp(-pcc)
             + commitment_loss
@@ -233,7 +249,61 @@ class BrainTokenizer(nn.Module):
                 + amp_loss
                 + 0.5 * phase_loss
             ).detach(),
-        }, indices
+        }
+        if return_monitor_data:
+            dropped_mask = torch.zeros(
+                x.shape[:2],
+                dtype=torch.bool,
+                device=x.device,
+            )
+            dropped_mask[:, :n_mask_channel] = True
+            monitor_data = {
+                "target": x.detach(),
+                "reconstruction": x_rec.detach(),
+                "dropped_channel_mask": dropped_mask,
+                "sensor_type": sensor_type.index_select(
+                    dim=1,
+                    index=random_index,
+                ).detach(),
+                "source_latent": source_latent.detach(),
+                "indices": indices.detach(),
+                **rvq_monitor,
+            }
+            return output, indices, monitor_data
+        return output, indices
+
+    @torch.no_grad()
+    def monitor_attention(
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        sensor_type: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return source-query sensor attention for one validation batch.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Brain signals of shape ``(batch, channels, samples)``.
+        pos : torch.Tensor
+            Sensor geometry of shape ``(batch, channels, 6)``.
+        sensor_type : torch.Tensor
+            Sensor categories of shape ``(batch, channels)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Attention weights with shape
+            ``(batch, windows, heads, sources, channels)``.
+        """
+        x = self.unfold(x)
+        sensor_embedding = self.sensor_embed(pos, sensor_type)
+        _, attention = self.encoder(
+            x,
+            sensor_embedding,
+            return_attention=True,
+        )
+        return attention
 
     @torch.no_grad()
     def visualize(

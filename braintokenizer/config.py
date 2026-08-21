@@ -55,6 +55,13 @@ class BrainTokenizerTrainerConfig:
         self.checkpoint_interval_epochs = invocation[
             "checkpoint_interval_epochs"
         ]
+        monitoring = invocation["monitoring"]
+        self.lightweight_monitor_interval_steps = monitoring[
+            "lightweight_interval_steps"
+        ]
+        self.diagnostic_monitor_interval_steps = monitoring[
+            "diagnostic_interval_steps"
+        ]
         self.visualization_interval_steps = invocation[
             "visualization_interval_steps"
         ]
