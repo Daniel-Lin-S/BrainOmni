@@ -5,11 +5,14 @@ from __future__ import annotations
 from copy import deepcopy
 from hashlib import sha256
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import yaml
+
+from braintokenizer.constants import DEFAULT_NOISE_STD
 
 COMMON_CAMPAIGN = {
     "stage",
@@ -108,6 +111,7 @@ def load_pretrain_config(
     config: dict[str, Any] = {}
     for path in paths:
         config = _merge(config, _load_mapping(path))
+    _apply_semantic_defaults(config)
     for override in overrides or []:
         _apply_override(config, override)
     if data_catalog_path is not None:
@@ -119,6 +123,18 @@ def load_pretrain_config(
         invocation["data_catalog"] = load_data_catalog(data_catalog_path)
     validate_pretrain_config(config)
     return config
+
+
+def _apply_semantic_defaults(config: dict[str, Any]) -> None:
+    """Materialize semantic defaults before validation and persistence."""
+    campaign = config.get("campaign")
+    if not isinstance(campaign, dict):
+        return
+    if campaign.get("stage") != "braintokenizer":
+        return
+    objective = campaign.get("objective")
+    if isinstance(objective, dict):
+        objective.setdefault("noise_std", DEFAULT_NOISE_STD)
 
 
 def load_pretrain_launch_config(
@@ -287,6 +303,8 @@ def _mapping(value: Any, keys: set[str], path: str) -> dict[str, Any]:
 def _number(value: Any, path: str, minimum: float = 0.0) -> None:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigError(f"Expected numeric {path}, got {value!r}.")
+    if not math.isfinite(value):
+        raise ConfigError(f"Expected finite {path}, got {value!r}.")
     if value < minimum:
         raise ConfigError(f"Expected {path} >= {minimum}, got {value}.")
 
@@ -480,12 +498,20 @@ def _validate_stage(campaign: dict[str, Any]) -> None:
             )
         objective = _mapping(
             objective,
-            {"channel_mask_ratio"},
+            {"channel_mask_ratio", "noise_std"},
             "campaign.objective",
         )
         _fraction(
             objective["channel_mask_ratio"],
             "campaign.objective.channel_mask_ratio",
+        )
+        if objective["channel_mask_ratio"] == 1:
+            raise ConfigError(
+                "Expected campaign.objective.channel_mask_ratio < 1, got 1."
+            )
+        _number(
+            objective["noise_std"],
+            "campaign.objective.noise_std",
         )
         return
     model = _mapping(

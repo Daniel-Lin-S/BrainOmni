@@ -68,11 +68,8 @@ write_terminal_log_message() {
 move_terminal_log() {
     local state="$1"
     local destination_directory
-    local destination_path
     local source_directory
-    local error_message
 
-    error_message="Could not remove empty terminal-log staging directory:"
     source_directory="${TERMINAL_LOG_DIRECTORY}"
     if [[ -z "${TERMINAL_LOG_STAGE:-}" ]]; then
         fail "Cannot move a terminal log before creating it."
@@ -80,17 +77,15 @@ move_terminal_log() {
     [[ -f "${TERMINAL_LOG_PATH}" ]] || return 0
     destination_directory="${PROJECT_ROOT}/logs/${TERMINAL_LOG_STAGE}/${state}"
     destination_directory+="/${BRAINOMNI_ATTEMPT_ID}"
-    destination_path="${destination_directory}/terminal.log"
-    mkdir -p "${destination_directory}"
-    mv "${TERMINAL_LOG_PATH}" "${destination_path}"
-    if ! rmdir "${source_directory}"; then
-        fail "${error_message} ${source_directory}"
-    fi
+    [[ ! -e "${destination_directory}" ]] || fail \
+        "Terminal-log destination already exists: ${destination_directory}"
+    mkdir -p "$(dirname "${destination_directory}")"
+    mv "${source_directory}" "${destination_directory}"
     TERMINAL_LOG_DIRECTORY="${destination_directory}"
-    TERMINAL_LOG_PATH="${destination_path}"
-    BRAINOMNI_TERMINAL_LOG_PATH="${destination_path}"
+    TERMINAL_LOG_PATH="${destination_directory}/terminal.log"
+    BRAINOMNI_TERMINAL_LOG_PATH="${TERMINAL_LOG_PATH}"
     export BRAINOMNI_TERMINAL_LOG_PATH
-    write_terminal_log_message "Terminal log: ${destination_path}"
+    write_terminal_log_message "Terminal log: ${TERMINAL_LOG_PATH}"
 }
 
 log_config_paths() {
@@ -187,6 +182,9 @@ select_vacant_gpus() {
     (( ${#device_ids[@]} == requested )) || fail \
         "Requested ${requested} GPUs, but only ${#device_ids[@]} are available."
 
-    CUDA_VISIBLE_DEVICES="$(IFS=,; printf '%s' "${device_ids[*]}")"
-    export CUDA_VISIBLE_DEVICES
+    SELECTED_CUDA_DEVICES="$(IFS=,; printf '%s' "${device_ids[*]}")"
+    DEEPSPEED_INCLUDE="localhost:${SELECTED_CUDA_DEVICES}"
+    unset CUDA_VISIBLE_DEVICES
+    export SELECTED_CUDA_DEVICES
+    export DEEPSPEED_INCLUDE
 }

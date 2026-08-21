@@ -143,7 +143,6 @@ class Trainer:
         del self.val_loader
         self._evaluate_requested_datasets()
         self.writer.close()
-        dist.destroy_process_group()
 
     def _train_epochs(self):
         self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")

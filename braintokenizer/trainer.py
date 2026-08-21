@@ -165,7 +165,6 @@ class Trainer:
         del self.val_loader
         self._evaluate_requested_datasets()
         self.writer.close()
-        dist.destroy_process_group()
 
     def _train_epochs(self):
         self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
@@ -639,6 +638,7 @@ class Trainer:
         model = BrainTokenizer(
             **self.cfg.get_model_cfg(),
             channel_mask_ratio=self.cfg.channel_mask_ratio,
+            noise_std=self.cfg.noise_std,
         )
         model, _, _, _ = deepspeed.initialize(
             model=model,

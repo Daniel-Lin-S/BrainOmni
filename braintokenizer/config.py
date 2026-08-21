@@ -33,6 +33,7 @@ class BrainTokenizerTrainerConfig:
         self.rotation_trick = model["rotation_trick"]
         self.quantize_optimize_method = model["quantize_optimize_method"]
         self.channel_mask_ratio = campaign["objective"]["channel_mask_ratio"]
+        self.noise_std = campaign["objective"]["noise_std"]
         self.batch_size = invocation["batch_size_per_gpu"]
         self.num_workers = invocation["num_workers"]
         self.epoch = campaign["training"]["epochs"]

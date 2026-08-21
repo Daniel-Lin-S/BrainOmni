@@ -114,6 +114,10 @@ class PretrainConfigTest(unittest.TestCase):
             )
             self.assertEqual(config["campaign"]["training"]["epochs"], 16)
             self.assertEqual(config["campaign"]["model"]["codebook_size"], 512)
+            self.assertEqual(
+                config["campaign"]["objective"]["noise_std"],
+                0.1,
+            )
             _, accumulation = build_deepspeed_config(config, world_size=8)
             json_path = root / "braintokenizer.json"
             json_path.write_text(json.dumps(config))
@@ -189,6 +193,42 @@ class PretrainConfigTest(unittest.TestCase):
             ] = 0
             with self.assertRaises(ConfigError):
                 validate_pretrain_config(invalid_monitor)
+            invalid_mask = deepcopy(config)
+            invalid_mask["campaign"]["objective"][
+                "channel_mask_ratio"
+            ] = 1
+            with self.assertRaisesRegex(ConfigError, "channel_mask_ratio < 1"):
+                validate_pretrain_config(invalid_mask)
+            invalid_noise = deepcopy(config)
+            invalid_noise["campaign"]["objective"]["noise_std"] = -0.1
+            with self.assertRaisesRegex(ConfigError, "noise_std >= 0"):
+                validate_pretrain_config(invalid_noise)
+            invalid_noise["campaign"]["objective"]["noise_std"] = float(
+                "nan"
+            )
+            with self.assertRaisesRegex(ConfigError, "finite.*noise_std"):
+                validate_pretrain_config(invalid_noise)
+
+    def test_tokenizer_noise_default_is_materialized(self) -> None:
+        """Persist the semantic noise default when a config omits it."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = yaml.safe_load(
+                (ROOT / "configs/pretrain/braintokenizer.yaml").read_text()
+            )
+            del source["campaign"]["objective"]["noise_std"]
+            config_path = root / "without-noise.yaml"
+            config_path.write_text(yaml.safe_dump(source))
+            config = load_pretrain_config(
+                [
+                    config_path,
+                    write_local_overlay(root, "braintokenizer"),
+                ]
+            )
+        self.assertEqual(
+            config["campaign"]["objective"]["noise_std"],
+            0.1,
+        )
 
     def test_data_catalog_loading_and_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

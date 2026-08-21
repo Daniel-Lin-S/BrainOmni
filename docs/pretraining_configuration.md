@@ -79,7 +79,8 @@ Campaign settings are checkpoint-semantic and are saved in `pretrain_setting.yam
 | `campaign.model.num_quantizers` | positive integer, `4` | Residual vector-quantizer levels. |
 | `campaign.model.rotation_trick` | boolean, `true` | Uses the rotation-gradient estimator. |
 | `campaign.model.quantize_optimize_method` | `ema`, `ema` | Codebook update method. |
-| `campaign.objective.channel_mask_ratio` | fraction [0,1], `.25` | Randomly masked input-channel share. |
+| `campaign.objective.channel_mask_ratio` | fraction [0,1), `.25` | Randomly hidden input-channel share; `0` hides none, while positive values require at least two channels. |
+| `campaign.objective.noise_std` | non-negative float, `.1` | Gaussian input-noise standard deviation used only during training. |
 | `campaign.optimizer.type` | `AdamW`, `AdamW` | Optimizer implementation. |
 | `campaign.optimizer.lr` | positive float, `2e-4` | Main parameter learning rate. |
 | `campaign.optimizer.codebook_lr` | positive float, `3e-4` | RVQ codebook learning rate. |

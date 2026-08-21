@@ -13,8 +13,15 @@ import warnings
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.utils import spectral_norm, weight_norm
+from torch.nn.utils import spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
 import einops
+
+
+WEIGHT_NORM_MAGNITUDE_KEY = "parametrizations.weight.original0"
+WEIGHT_NORM_DIRECTION_KEY = "parametrizations.weight.original1"
+LEGACY_WEIGHT_NORM_MAGNITUDE_KEY = "weight_g"
+LEGACY_WEIGHT_NORM_DIRECTION_KEY = "weight_v"
 
 
 CONV_NORMALIZATIONS = frozenset(
@@ -27,6 +34,24 @@ CONV_NORMALIZATIONS = frozenset(
         "time_group_norm",
     ]
 )
+
+
+def _save_legacy_weight_norm_state(
+    module: nn.Module,
+    state: dict[str, torch.Tensor],
+    prefix: str,
+    local_metadata: dict,
+) -> None:
+    """Expose parametrized weights under the released checkpoint schema."""
+    del module, local_metadata
+    magnitude_key = f"{prefix}{WEIGHT_NORM_MAGNITUDE_KEY}"
+    direction_key = f"{prefix}{WEIGHT_NORM_DIRECTION_KEY}"
+    state[f"{prefix}{LEGACY_WEIGHT_NORM_MAGNITUDE_KEY}"] = state.pop(
+        magnitude_key
+    )
+    state[f"{prefix}{LEGACY_WEIGHT_NORM_DIRECTION_KEY}"] = state.pop(
+        direction_key
+    )
 
 
 class ConvLayerNorm(nn.LayerNorm):
@@ -47,10 +72,17 @@ class ConvLayerNorm(nn.LayerNorm):
         return
 
 
-def apply_parametrization_norm(module: nn.Module, norm: str = "none") -> nn.Module:
+def apply_parametrization_norm(
+    module: nn.Module,
+    norm: str = "none",
+) -> nn.Module:
     assert norm in CONV_NORMALIZATIONS
     if norm == "weight_norm":
-        return weight_norm(module)
+        parametrized = weight_norm(module)
+        parametrized.register_state_dict_post_hook(
+            _save_legacy_weight_norm_state
+        )
+        return parametrized
     elif norm == "spectral_norm":
         return spectral_norm(module)
     else:

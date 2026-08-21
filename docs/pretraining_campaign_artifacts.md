@@ -52,7 +52,7 @@ bash script/repair_pretrain_campaign.sh --campaign-root CAMPAIGN
 
 ## Terminal-log lifecycle
 
-Terminal logs are repository-local operational diagnostics. They are not
+Terminal logs are repository-local operational diagnostics. They are NOT
 portable checkpoint artifacts. The launcher creates a unique attempt log before
 it can know a semantic campaign hash, so it first writes to:
 
@@ -70,14 +70,16 @@ returns and remain visible in the terminal, but are excluded from terminal logs.
 
 | Outcome | Final terminal-log location | Meaning |
 | --- | --- | --- |
-| Preprocessing succeeds | `logs/preprocess/complete/<attempt-id>/terminal.log` | Raw preprocessing completed. |
-| A launcher command fails before a campaign is resolved | `logs/<stage>/failed/<attempt-id>/terminal.log` | No semantic campaign log location exists. |
-| Training reaches campaign initialization | `logs/<stage>/<semantic-hash>/<attempt-id>/terminal.log` | The terminal log is tied to its resolved campaign. |
+| Stage succeeds | `logs/<stage>/complete/<attempt-id>/terminal.log` | Training completed successfully. |
+| Stage fails | `logs/<stage>/failed/<attempt-id>/terminal.log` | Training stopped with a nonzero exit status. |
 
-After campaign initialization, `attempts/<attempt-id>/status.json` is the
-authoritative outcome record. A training error remains in that campaign-specific
-terminal log and records `state: failed` in the attempt status; it is not moved
-to the generic `failed` directory because its semantic identity is known.
+`<stage>` can be one of preproces, braintokenizer, brainomni.
+
+The parent launcher moves the complete attempt log directory only after
+DeepSpeed exits, so no pending attempt directory remains after either outcome. Training
+`logs.txt`, when present, moves alongside `terminal.log`. The campaign artifact
+`attempts/<attempt-id>/status.json` remains the authoritative structured
+record of campaign identity and outcome.
 
 ## Preprocessing metadata
 

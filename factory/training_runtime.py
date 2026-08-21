@@ -27,6 +27,12 @@ from factory.campaign import (
 from pretrain_config import canonical_config_sha256, sha256_file
 
 
+def destroy_distributed_process_group() -> None:
+    """Release an initialized process group during success or failure."""
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def _engine_recovery_identity(engine: Any) -> dict[str, Any]:
     """Return DeepSpeed runtime fields required for exact state recovery."""
     return {

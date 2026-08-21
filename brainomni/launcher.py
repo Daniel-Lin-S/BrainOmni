@@ -15,9 +15,9 @@ from factory.campaign import (
     ensure_training_campaign,
     prepare_campaign,
     record_attempt_repair,
-    relocate_terminal_log,
     update_attempt_status,
 )
+from factory.training_runtime import destroy_distributed_process_group
 from pretrain_config import (
     load_pretrain_launch_config,
     resolve_dataset_identities,
@@ -72,10 +72,6 @@ def main() -> None:
     )
     if rank == 0 and trainer_config.tokenizer_health.repaired:
         record_attempt_repair(context, trainer_config.tokenizer_health)
-    if rank == 0:
-        relocated = relocate_terminal_log(context)
-        if relocated is not None:
-            print(f"Terminal log: {relocated.resolve()}")
     training_required = ensure_training_campaign(context, rank=rank)
     try:
         Trainer(
@@ -93,6 +89,8 @@ def main() -> None:
     else:
         if rank == 0:
             update_attempt_status(context, "complete")
+    finally:
+        destroy_distributed_process_group()
 
 
 if __name__ == "__main__":

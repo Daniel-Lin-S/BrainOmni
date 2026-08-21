@@ -42,6 +42,10 @@ cd "${PROJECT_ROOT}"
 
 log_config_paths "${arguments[@]}"
 run_with_terminal_log \
-    printf 'Selected CUDA devices: %s\n' "${CUDA_VISIBLE_DEVICES}"
-run_with_terminal_log deepspeed --num_gpus="${num_gpus}" \
-    --module braintokenizer.launcher "${arguments[@]}"
+    printf 'Selected CUDA devices: %s\n' "${SELECTED_CUDA_DEVICES}"
+if run_with_terminal_log deepspeed --include="${DEEPSPEED_INCLUDE}" \
+    --module braintokenizer.launcher "${arguments[@]}"; then
+    move_terminal_log "complete"
+else
+    exit "$?"
+fi

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import torch
 
+from brainomni.model import BrainOmni
 from factory.pretraining_monitor_events import (
     MonitorEvent,
     canonicalize_tag,
@@ -141,6 +142,72 @@ class PretrainingMonitorTest(unittest.TestCase):
                 if isinstance(statement, ast.Return)
             )
             self.assertEqual(ast.unparse(final_return.value), expected_return)
+
+    def test_stage_two_monitor_loss_preserves_gradients(self) -> None:
+        """Keep the optimized Stage-2 objective independent of monitoring."""
+        torch.manual_seed(13)
+        ordinary_logits = torch.randn(
+            2,
+            3,
+            4,
+            2,
+            7,
+            requires_grad=True,
+        )
+        monitored_logits = ordinary_logits.detach().clone().requires_grad_()
+        labels = torch.randint(7, (2, 3, 4, 2))
+        preserved_mask = torch.tensor(
+            [
+                [
+                    [True, False, True, False],
+                    [False, True, False, True],
+                    [True, False, False, True],
+                ],
+                [
+                    [False, True, True, False],
+                    [True, False, True, False],
+                    [False, False, True, True],
+                ],
+            ]
+        )
+        ordinary_loss, ordinary_accuracy = (
+            BrainOmni._compute_cross_entropy(
+                None,
+                ordinary_logits,
+                labels,
+                preserved_mask,
+            )
+        )
+        ordinary_gradient, = torch.autograd.grad(
+            ordinary_loss,
+            ordinary_logits,
+        )
+        monitored_loss, monitored_accuracy, _, _ = (
+            BrainOmni._compute_cross_entropy(
+                None,
+                monitored_logits,
+                labels,
+                preserved_mask,
+                return_details=True,
+            )
+        )
+        monitored_gradient, = torch.autograd.grad(
+            monitored_loss,
+            monitored_logits,
+        )
+        torch.testing.assert_close(ordinary_loss, monitored_loss)
+        torch.testing.assert_close(
+            ordinary_accuracy,
+            monitored_accuracy,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            ordinary_gradient,
+            monitored_gradient,
+            rtol=0,
+            atol=0,
+        )
 
     def test_assignment_and_residual_metrics(self) -> None:
         counts = torch.tensor([[2.0, 2.0, 0.0, 0.0]])

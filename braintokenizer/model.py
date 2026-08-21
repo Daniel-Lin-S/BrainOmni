@@ -1,8 +1,12 @@
-import torch
+import math
 from typing import Tuple
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+from braintokenizer.constants import DEFAULT_NOISE_STD
 from model_utils.attn import RMSNorm
 from model_utils.loss import get_time_loss, get_pcc, get_frequency_domain_loss
 from model_utils.module import (
@@ -30,6 +34,8 @@ class BrainTokenizer(nn.Module):
         Module for encoding sensor positions and types.
     mask_ratio : float
         Ratio of channels to mask during training to improve robustness.
+    noise_std : float
+        Gaussian input-noise standard deviation used only during training.
     encoder : BrainTokenizerEncoder
         Spatial-temporal encoder for brain signals.
     quantizer : BrainQuantizer
@@ -71,9 +77,30 @@ class BrainTokenizer(nn.Module):
         super().__init__()
         self.window_length = window_length
         self.n_dim = n_dim
-        self.sensor_embed = BrainSensorModule(n_dim)
         self.mask_ratio = kwargs.get("channel_mask_ratio", 0.25)
+        self.noise_std = kwargs.get("noise_std", DEFAULT_NOISE_STD)
+        if (
+            not isinstance(self.mask_ratio, (int, float))
+            or isinstance(self.mask_ratio, bool)
+            or not math.isfinite(self.mask_ratio)
+            or not 0 <= self.mask_ratio < 1
+        ):
+            raise ValueError(
+                "Expected channel_mask_ratio in [0, 1), got "
+                f"{self.mask_ratio!r}."
+            )
+        if (
+            not isinstance(self.noise_std, (int, float))
+            or isinstance(self.noise_std, bool)
+            or not math.isfinite(self.noise_std)
+            or self.noise_std < 0
+        ):
+            raise ValueError(
+                "Expected finite noise_std >= 0, got "
+                f"{self.noise_std!r}."
+            )
 
+        self.sensor_embed = BrainSensorModule(n_dim)
         self.encoder = BrainTokenizerEncoder(
             n_filters=n_filters,
             ratios=ratios,
@@ -161,6 +188,52 @@ class BrainTokenizer(nn.Module):
         x = x / (x.std(dim=-1,keepdim=True)+1e-6)
         return x
 
+    def add_noise(self, x: torch.Tensor) -> torch.Tensor:
+        """Add configured Gaussian noise only while training.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Visible input windows of shape
+            ``(batch, channels, windows, samples)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Training input with Gaussian noise, or the unchanged input during
+            evaluation and when ``noise_std`` is zero.
+        """
+        if not self.training or self.noise_std == 0:
+            return x
+        return x + torch.randn_like(x) * self.noise_std
+
+    def masked_channel_count(self, channel_count: int) -> int:
+        """Return a safe number of input channels to hide.
+
+        Parameters
+        ----------
+        channel_count : int
+            Number of channels in the current batch.
+
+        Returns
+        -------
+        int
+            Number of channels to hide before encoding.
+        """
+        if channel_count <= 0:
+            raise ValueError(
+                "BrainTokenizer requires at least one input channel, got "
+                f"{channel_count}."
+            )
+        if self.mask_ratio == 0:
+            return 0
+        if channel_count == 1:
+            raise ValueError(
+                "Positive channel masking requires at least two input "
+                f"channels, got {channel_count}."
+            )
+        return max(int(channel_count * self.mask_ratio), 1)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -209,7 +282,7 @@ class BrainTokenizer(nn.Module):
         random_index = torch.randperm(x.shape[1], device=x.device)
         x = x.index_select(dim=1, index=random_index)
         sensor_embedding = sensor_embedding.index_select(dim=1, index=random_index)
-        n_mask_channel = max(int(x.shape[1] * self.mask_ratio), 1)
+        n_mask_channel = self.masked_channel_count(x.shape[1])
         source_latent = self.encoder(
             self.add_noise(x[:, n_mask_channel:]),
             sensor_embedding[:, n_mask_channel:],

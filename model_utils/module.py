@@ -87,9 +87,14 @@ class BackWardSolution(nn.Module):
                 (q.float() @ k.float().transpose(-2, -1)) * scale,
                 dim=-1,
             )
+        attention_dropout = 0.0 if return_attention else self.dropout
         output = (
             F.scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.dropout, is_causal=False
+                query=q,
+                key=k,
+                value=v,
+                dropout_p=attention_dropout,
+                is_causal=False,
             )
             .transpose(1, 2)
             .contiguous()

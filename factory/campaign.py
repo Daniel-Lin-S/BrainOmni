@@ -378,12 +378,21 @@ def prepare_campaign(
 
 
 def repository_attempt_log_directory(context: CampaignContext) -> Path:
-    """Return the repository text-log directory for one campaign attempt."""
+    """Return the active repository log directory for one attempt."""
+    terminal_log = os.environ.get("BRAINOMNI_TERMINAL_LOG_PATH")
+    if terminal_log:
+        directory = Path(terminal_log).resolve().parent
+        if directory.name != context.attempt_id:
+            raise ConfigError(
+                "Terminal-log attempt identifier does not match the "
+                "resolved campaign attempt."
+            )
+        return directory
     return (
         Path(__file__).resolve().parents[1]
         / "logs"
         / context.stage
-        / context.root.name
+        / "pending"
         / context.attempt_id
     )
 
@@ -1104,25 +1113,6 @@ def restore_rng_client_state(
         float(state["best_eval_loss"]),
         int(state["train_step_counter"]),
     )
-
-
-def relocate_terminal_log(context: CampaignContext) -> Path | None:
-    """Move the active launcher log into its semantic campaign directory."""
-    source_text = os.environ.get("BRAINOMNI_TERMINAL_LOG_PATH")
-    if not source_text:
-        return None
-    source = Path(source_text).resolve()
-    destination = repository_attempt_log_directory(context) / "terminal.log"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source == destination:
-        return destination
-    if destination.exists():
-        raise ConfigError(
-            f"Attempt terminal log already exists: {destination.resolve()}. "
-            "Use a unique BRAINOMNI_ATTEMPT_ID and retry."
-        )
-    source.replace(destination)
-    return destination
 
 
 def update_attempt_status(

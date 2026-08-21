@@ -31,6 +31,7 @@ campaign:
     quantize_optimize_method: ema
   objective:
     channel_mask_ratio: 0.25
+    noise_std: 0.1
   optimizer:
     type: AdamW
     lr: 0.0002
