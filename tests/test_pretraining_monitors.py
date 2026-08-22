@@ -622,6 +622,23 @@ class PretrainingMonitorTest(unittest.TestCase):
         self.assertEqual(statistics.require("sum").item(), 6.0)
         self.assertEqual(statistics.require("count").item(), 4.0)
 
+    def test_sufficient_statistics_are_contiguous_for_reduction(self) -> None:
+        statistics = TensorSums()
+        statistics.add(
+            "noncontiguous",
+            torch.arange(6, dtype=torch.float32)
+            .reshape(2, 3)
+            .transpose(0, 1),
+        )
+
+        def reduce_sum(value: torch.Tensor) -> None:
+            self.assertTrue(value.is_contiguous())
+            value.add_(1.0)
+
+        statistics.reduce_(reduce_sum)
+        self.assertTrue(statistics.require("noncontiguous").is_contiguous())
+        self.assertEqual(statistics.require("noncontiguous").shape, (3, 2))
+
     def test_optimizer_step_and_update_ratio(self) -> None:
         engine = FakeEngine([torch.tensor([3.0, 4.0])])
         self.assertEqual(successful_optimizer_steps(engine), 6)

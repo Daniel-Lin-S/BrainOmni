@@ -487,7 +487,9 @@ class TensorSums:
 
     def add(self, name: str, value: torch.Tensor | float) -> None:
         """Add one detached value to a named sufficient statistic."""
-        tensor = torch.as_tensor(value).detach().to(dtype=torch.float64)
+        tensor = torch.as_tensor(value).detach().to(
+            dtype=torch.float64,
+        ).contiguous()
         ensure_finite(tensor, name)
         if name not in self.values:
             self.values[name] = tensor.clone()
