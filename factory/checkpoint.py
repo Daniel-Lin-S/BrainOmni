@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import torch
+
 from factory.campaign import portable_weight_name
+from model_utils.conv import legacy_weight_norm_state_dict
 
 
 def convert_best_checkpoint(
@@ -54,22 +58,40 @@ def convert_best_checkpoint(
         )
     try:
         from deepspeed.utils.zero_to_fp32 import (
-            convert_zero_checkpoint_to_fp32_state_dict,
+            get_fp32_state_dict_from_zero_checkpoint,
         )
     except ImportError as error:
         raise RuntimeError(
             "DeepSpeed checkpoint conversion is unavailable. Install the "
             "training environment, then rerun campaign repair."
         ) from error
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    convert_zero_checkpoint_to_fp32_state_dict(
+    state = get_fp32_state_dict_from_zero_checkpoint(
         str(campaign_root / "checkpoint"),
-        str(destination),
         tag="best",
+        exclude_frozen_parameters=False,
+        lazy_mode=False,
     )
-    if not destination.is_file() or destination.stat().st_size == 0:
+    if not isinstance(state, dict) or not state:
         raise RuntimeError(
-            "Checkpoint conversion produced no portable weights: "
-            f"{destination}. Inspect checkpoint/best and rerun repair."
+            "Best checkpoint conversion returned no tensor state at "
+            f"{best_path.resolve()}."
         )
+    portable_state = legacy_weight_norm_state_dict(state)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.convert"
+    )
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        torch.save(portable_state, temporary)
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise RuntimeError(
+                "Checkpoint conversion produced no portable weights: "
+                f"{temporary}."
+            )
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     return destination

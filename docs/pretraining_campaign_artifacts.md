@@ -38,9 +38,11 @@ interrupted campaign with the same identity can resume.
 
 Both portable weight files are checked against their architecture and canonical
 tensor-state digest. A damaged file can be reconstructed atomically from the
-verified best checkpoint. If training-side repair fails, the unusable checkpoint
-state remains under `failed_recovery_<id>` until a newly trained best checkpoint
-and portable weight validate.
+verified best checkpoint. Consolidation writes the exact portable file directly
+and does not require model-hub or sharded-serialization dependencies. If
+training-side repair fails, the unusable checkpoint state remains under
+`failed_recovery_<id>` until a newly trained best checkpoint and portable weight
+validate.
 
 BrainOmni checks `invocation.tokenizer_path` before Stage 2, and downstream
 loading checks a BrainOmni campaign root. Consumer repair never starts

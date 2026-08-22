@@ -10,10 +10,18 @@ import torch
 from torch import nn
 from torch.nn.utils import weight_norm as legacy_weight_norm
 
+from brainomni.model import BrainOmni
 from braintokenizer.model import BrainTokenizer
 from factory.campaign import tensor_state_sha256
 from factory.training_runtime import destroy_distributed_process_group
-from model_utils.conv import apply_parametrization_norm
+from model_utils.conv import (
+    LEGACY_WEIGHT_NORM_DIRECTION_KEY,
+    LEGACY_WEIGHT_NORM_MAGNITUDE_KEY,
+    WEIGHT_NORM_DIRECTION_KEY,
+    WEIGHT_NORM_MAGNITUDE_KEY,
+    apply_parametrization_norm,
+    legacy_weight_norm_state_dict,
+)
 from model_utils.module import BackWardSolution
 
 
@@ -199,6 +207,42 @@ class BrainTokenizerTrainingBehaviorTest(unittest.TestCase):
         )
         restored = BrainTokenizer(**SMALL_TOKENIZER_CONFIG)
         restored.load_state_dict(state, strict=True)
+
+    def test_consolidated_brainomni_state_uses_portable_norm_names(
+        self,
+    ) -> None:
+        """Canonicalize nested tokenizer weights in Stage-2 exports."""
+        config = {
+            **SMALL_TOKENIZER_CONFIG,
+            "lm_dim": 8,
+            "lm_head": 2,
+            "lm_depth": 1,
+            "lm_dropout": 0.0,
+            "overlap_ratio": 0.25,
+            "mask_ratio": 0.5,
+            "num_quantizers_used": 2,
+        }
+        model = BrainOmni(**config)
+        portable = model.state_dict()
+        reconstructed = {}
+        for key, tensor in portable.items():
+            key = key.replace(
+                LEGACY_WEIGHT_NORM_MAGNITUDE_KEY,
+                WEIGHT_NORM_MAGNITUDE_KEY,
+            )
+            key = key.replace(
+                LEGACY_WEIGHT_NORM_DIRECTION_KEY,
+                WEIGHT_NORM_DIRECTION_KEY,
+            )
+            reconstructed[key] = tensor
+        converted = legacy_weight_norm_state_dict(reconstructed)
+        self.assertEqual(set(converted), set(portable))
+        self.assertEqual(
+            tensor_state_sha256(converted),
+            tensor_state_sha256(portable),
+        )
+        restored = BrainOmni(**config)
+        restored.load_state_dict(converted, strict=True)
 
     def test_distributed_cleanup_is_safe_and_conditional(self) -> None:
         """Destroy initialized process groups without touching absent groups."""

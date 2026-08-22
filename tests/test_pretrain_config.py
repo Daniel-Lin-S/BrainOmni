@@ -12,6 +12,7 @@ from types import ModuleType
 import unittest
 from unittest import mock
 
+import torch
 import yaml
 
 from brainomni.config import BrainOmniTrainerConfig
@@ -40,6 +41,21 @@ from pretrain_config import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def mocked_zero_modules(consolidate: object) -> dict[str, ModuleType]:
+    """Return temporary DeepSpeed modules exposing one consolidator."""
+    zero_module = ModuleType("deepspeed.utils.zero_to_fp32")
+    zero_module.get_fp32_state_dict_from_zero_checkpoint = consolidate
+    utils_module = ModuleType("deepspeed.utils")
+    deepspeed_module = ModuleType("deepspeed")
+    utils_module.zero_to_fp32 = zero_module
+    deepspeed_module.utils = utils_module
+    return {
+        "deepspeed": deepspeed_module,
+        "deepspeed.utils": utils_module,
+        "deepspeed.utils.zero_to_fp32": zero_module,
+    }
 
 
 def write_local_overlay(directory: Path, stage: str) -> Path:
@@ -767,27 +783,63 @@ class PretrainConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run_path = Path(temporary) / "run"
             (run_path / "checkpoint" / "best").mkdir(parents=True)
-            zero_module = ModuleType("deepspeed.utils.zero_to_fp32")
+            magnitude = torch.ones(2, 1, 1)
+            direction = torch.arange(6).reshape(2, 1, 3)
 
-            def convert(checkpoint: str, output: str, tag: str) -> None:
+            def consolidate(
+                checkpoint: str,
+                tag: str,
+                exclude_frozen_parameters: bool,
+                lazy_mode: bool,
+            ) -> dict[str, torch.Tensor]:
                 self.assertEqual(Path(checkpoint), run_path / "checkpoint")
                 self.assertEqual(tag, "best")
-                Path(output).write_bytes(b"checkpoint")
+                self.assertFalse(exclude_frozen_parameters)
+                self.assertFalse(lazy_mode)
+                return {
+                    "layer.parametrizations.weight.original0": magnitude,
+                    "layer.parametrizations.weight.original1": direction,
+                    "layer.bias": torch.zeros(2),
+                }
 
-            zero_module.convert_zero_checkpoint_to_fp32_state_dict = convert
-            utils_module = ModuleType("deepspeed.utils")
-            deepspeed_module = ModuleType("deepspeed")
-            utils_module.zero_to_fp32 = zero_module
-            deepspeed_module.utils = utils_module
-            modules = {
-                "deepspeed": deepspeed_module,
-                "deepspeed.utils": utils_module,
-                "deepspeed.utils.zero_to_fp32": zero_module,
-            }
-            with mock.patch.dict(sys.modules, modules):
+            with mock.patch.dict(
+                sys.modules,
+                mocked_zero_modules(consolidate),
+            ):
                 output_path = convert_best_checkpoint(run_path)
             self.assertEqual(output_path, run_path / "BrainTokenizer.pt")
-            self.assertEqual(output_path.read_bytes(), b"checkpoint")
+            state = torch.load(output_path, weights_only=True)
+            self.assertEqual(
+                set(state),
+                {"layer.weight_g", "layer.weight_v", "layer.bias"},
+            )
+            torch.testing.assert_close(state["layer.weight_g"], magnitude)
+            torch.testing.assert_close(state["layer.weight_v"], direction)
+            with self.assertRaises(FileExistsError):
+                convert_best_checkpoint(run_path)
+
+    def test_failed_checkpoint_conversion_removes_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_path = Path(temporary) / "run"
+            (run_path / "checkpoint" / "best").mkdir(parents=True)
+
+            def consolidate(*args, **kwargs) -> dict[str, torch.Tensor]:
+                del args, kwargs
+                return {"weight": torch.ones(1)}
+
+            with mock.patch.dict(
+                sys.modules,
+                mocked_zero_modules(consolidate),
+            ), mock.patch(
+                "factory.checkpoint.torch.save",
+                side_effect=OSError("disk write failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "disk write failed"):
+                    convert_best_checkpoint(run_path)
+            self.assertFalse((run_path / "BrainTokenizer.pt").exists())
+            self.assertFalse(
+                list(run_path.glob(".BrainTokenizer.pt.*.convert"))
+            )
 
     def test_documentation_covers_schema_and_public_files_have_no_paths(
         self,

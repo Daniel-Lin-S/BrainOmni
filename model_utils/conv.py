@@ -36,6 +36,42 @@ CONV_NORMALIZATIONS = frozenset(
 )
 
 
+def legacy_weight_norm_state_dict(
+    state: tp.Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Return a state dictionary using released weight-normalization keys.
+
+    Parameters
+    ----------
+    state : Mapping[str, torch.Tensor]
+        Tensor mapping reconstructed from a model or distributed checkpoint.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        Tensor mapping with parametrization magnitude and direction names
+        converted to ``weight_g`` and ``weight_v`` respectively.
+    """
+    replacements = (
+        (WEIGHT_NORM_MAGNITUDE_KEY, LEGACY_WEIGHT_NORM_MAGNITUDE_KEY),
+        (WEIGHT_NORM_DIRECTION_KEY, LEGACY_WEIGHT_NORM_DIRECTION_KEY),
+    )
+    converted: dict[str, torch.Tensor] = {}
+    for original_key, tensor in state.items():
+        key = original_key
+        for parametrized_suffix, legacy_suffix in replacements:
+            if key.endswith(parametrized_suffix):
+                key = f"{key[:-len(parametrized_suffix)]}{legacy_suffix}"
+                break
+        if key in converted:
+            raise RuntimeError(
+                "Weight-normalization key conversion produced duplicate "
+                f"tensor name {key!r}."
+            )
+        converted[key] = tensor
+    return converted
+
+
 def _save_legacy_weight_norm_state(
     module: nn.Module,
     state: dict[str, torch.Tensor],
