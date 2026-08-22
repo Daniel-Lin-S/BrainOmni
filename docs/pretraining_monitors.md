@@ -82,6 +82,18 @@ These monitors characterise optimisation dynamics and apply to both **Stage 1: B
 | **Global gradient norm** | Detect exploding gradients, unusually weak gradients, or abrupt optimisation instability | \(G_t=\sqrt{\sum_p \lVert\nabla_{\theta_p}L_t\rVert_2^2}\), where \(p\) indexes trainable parameter tensors | Every 100 optimiser steps | Low–moderate; requires reduction over all gradients |
 | **Update-to-weight ratio** | Measure effective parameter movement rather than gradient magnitude alone | \(R_t=\lVert\theta_{t+1}-\theta_t\rVert_2 / (\lVert\theta_t\rVert_2+\epsilon)\) | Every 500 optimiser steps | Moderate; requires parameter/update reductions |
 
+## 1.2 Sanity diagnostics
+
+Each training epoch records per-dataset sample exposure under `train/epoch/data/dataset_exposure_ratio/<dataset>`.
+
+Joint EEG/MEG training
+records EEG, MAG, and GRAD sample ratios under
+`train/epoch/data/modality_sample_exposure_ratio/<modality>` and channel
+ratios under `train/epoch/data/modality_channel_exposure_ratio/<modality>`.
+An EMEG sample contributes to each sensor type it contains. 
+
+Pure EEG or pure MEG training omits all modality-ratio tags.
+
 ---
 
 # 2. Stage 1 — BrainTokenizer

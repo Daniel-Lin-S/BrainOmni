@@ -112,3 +112,5 @@ scalar tags follow
 
 The training workflow does not create monitor CSV files. It stores only
 TensorBoard scalars and the existing reconstruction figures. Use the on-demand exporter `script/export_pretraining_monitors.py` when a tabular input (csv) is useful for another visualisation tool.
+Integrity warnings for invalid samples or non-finite training values are not
+written as TensorBoard, CSV, or campaign-status artifacts.

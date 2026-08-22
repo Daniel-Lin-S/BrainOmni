@@ -4,9 +4,9 @@ import time
 from pathlib import Path
 import random
 from typing import Any
+import warnings
 import numpy as np
 import torch
-from constant import SAMPLE_RATE, LOW, HIGH
 from factory.brain_constant import (
     EXCLUDE_DICT,
     RENAME_DICT,
@@ -269,8 +269,7 @@ def sensortype_wise_normalize(_data: np.ndarray, eeg_mask, mag_mask, grad_mask):
 
 
 def accept_segment(seg_data: np.ndarray, pos: np.ndarray):
-    bad = (np.isnan(seg_data).any()) | (np.isnan(pos).any())
-    return ~bad
+    return np.isfinite(seg_data).all() and np.isfinite(pos).all()
 
 
 def split_to_segments_save(
@@ -354,6 +353,14 @@ def split_to_segments_save(
                 ),
             }
             segments_metadata.append(metadata)
+        else:
+            warnings.warn(
+                "Skipped invalid pre-training segment with non-finite signal "
+                f"or position values: recording={raw_path}, start={start}, "
+                f"end={end}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         start += stride_length
         end += stride_length
     return segments_metadata

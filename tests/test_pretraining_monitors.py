@@ -7,8 +7,10 @@ import csv
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from brainomni.model import BrainOmni
@@ -21,8 +23,14 @@ from factory.pretraining_monitor_events import (
     write_monitor_csv,
 )
 from factory.pretraining_monitor_runtime import (
+    ExposureAccumulator,
     StageOneAccumulator,
     StageTwoAccumulator,
+)
+from factory.pretraining_integrity import (
+    nonfinite_gradient_names,
+    nonfinite_tensor_names,
+    warn_and_raise_distributed_failure,
 )
 from factory.pretraining_monitors import (
     TensorSums,
@@ -45,6 +53,8 @@ from factory.pretraining_monitors import (
     zero_partition_snapshot,
 )
 from pretrain_dataset import build_fixed_monitor_batch
+from pretrain_dataset import training_dataset_ids
+from factory.utils import split_to_segments_save
 
 
 class FakeAccessor:
@@ -75,6 +85,20 @@ class FakeEngine:
 
     def get_global_grad_norm(self) -> torch.Tensor:
         return torch.tensor(5.0)
+
+
+class FakeWriteAccessor:
+    """Record preprocessing writes without persisting tensors."""
+
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+
+    def mkdir(self, path: str) -> None:
+        del path
+
+    def write(self, data, path, writer) -> None:
+        del data, writer
+        self.writes.append(path)
 
 
 class PretrainingMonitorTest(unittest.TestCase):
@@ -111,6 +135,141 @@ class PretrainingMonitorTest(unittest.TestCase):
             canonicalize_tag("train_judge_loss")[0],
             canonicalize_tag("train_loss")[0],
         )
+
+    def test_actual_exposure_ratios(self) -> None:
+        accumulator = ExposureAccumulator(("eeg-set", "meg-set"))
+        accumulator.update(
+            ["eeg-set", "meg-set", "eeg-set"],
+            torch.tensor(
+                [[0, 1], [0, 0], [2, 2]],
+            ),
+        )
+        values = accumulator.values()
+        self.assertAlmostEqual(
+            values[
+                "train/epoch/data/dataset_exposure_ratio/eeg-set"
+            ].item(),
+            2.0 / 3.0,
+        )
+        self.assertAlmostEqual(
+            values[
+                "train/epoch/data/modality_sample_exposure_ratio/eeg"
+            ].item(),
+            2.0 / 3.0,
+        )
+        self.assertAlmostEqual(
+            values[
+                "train/epoch/data/modality_sample_exposure_ratio/mag"
+            ].item(),
+            1.0 / 3.0,
+        )
+        self.assertAlmostEqual(
+            values[
+                "train/epoch/data/modality_sample_exposure_ratio/grad"
+            ].item(),
+            1.0 / 3.0,
+        )
+        self.assertAlmostEqual(
+            values[
+                "train/epoch/data/modality_channel_exposure_ratio/eeg"
+            ].item(),
+            0.5,
+        )
+        self.assertAlmostEqual(
+            values[
+                "train/epoch/data/modality_channel_exposure_ratio/mag"
+            ].item(),
+            1.0 / 6.0,
+        )
+        self.assertAlmostEqual(
+            values[
+                "train/epoch/data/modality_channel_exposure_ratio/grad"
+            ].item(),
+            2.0 / 6.0,
+        )
+        pure = ExposureAccumulator(("eeg-set",))
+        pure.update(["eeg-set"], torch.tensor([[0, 0]]))
+        pure_values = pure.values()
+        self.assertFalse(
+            any("modality_" in tag for tag in pure_values)
+        )
+
+    def test_integrity_checks_warn_without_artifact_outputs(self) -> None:
+        invalid = nonfinite_tensor_names(
+            {
+                "x": torch.tensor([float("nan")]),
+                "sensor_type": torch.tensor([0]),
+            }
+        )
+        self.assertEqual(invalid, ["x"])
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        parameter.grad = torch.tensor([float("inf")])
+        module = torch.nn.Module()
+        module.register_parameter("weight", parameter)
+        self.assertEqual(nonfinite_gradient_names(module), ["weight"])
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            with self.assertRaisesRegex(FloatingPointError, "training loss"):
+                warn_and_raise_distributed_failure(
+                    ["loss"],
+                    "training loss",
+                    rank=0,
+                    device=torch.device("cpu"),
+                    reduce_max=lambda value: None,
+                )
+        self.assertEqual(len(records), 1)
+        self.assertIn("Non-finite training loss", str(records[0].message))
+
+    def test_invalid_preprocessing_segments_emit_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            recording = root / "recording.fif"
+            accessor = FakeWriteAccessor()
+            with warnings.catch_warnings(record=True) as records:
+                warnings.simplefilter("always")
+                metadata = split_to_segments_save(
+                    accessor=accessor,
+                    data=np.full((1, 5), np.inf),
+                    pos=np.zeros((1, 6)),
+                    sensor_type=np.zeros(1, dtype=np.int64),
+                    eeg_mask=np.array([True]),
+                    mag_mask=np.array([False]),
+                    grad_mask=np.array([False]),
+                    meg_mask=np.array([False]),
+                    path=str(recording),
+                    dataset="eeg-set",
+                    dataset_root=str(root),
+                    ready_path=str(root / "processed"),
+                    raw_duration_seconds=5.0,
+                    preprocessed_duration_seconds=5.0,
+                    signal_type="eeg",
+                    sample_rate_hz=1.0,
+                    TIME=2,
+                    STRIDE=2,
+                )
+        self.assertEqual(metadata, [])
+        self.assertEqual(accessor.writes, [])
+        self.assertTrue(
+            any("Skipped invalid pre-training segment" in str(item.message)
+                for item in records)
+        )
+
+    def test_training_dataset_ids_require_valid_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "train.json").write_text(
+                json.dumps(
+                    [
+                        {"dataset": "meg-set"},
+                        {"dataset": "eeg-set"},
+                        {"dataset": "meg-set"},
+                    ]
+                )
+            )
+            self.assertEqual(
+                training_dataset_ids(str(root)),
+                ("eeg-set", "meg-set"),
+            )
 
     def test_monitor_payloads_are_opt_in_at_model_boundaries(self) -> None:
         root = Path(__file__).resolve().parents[1]

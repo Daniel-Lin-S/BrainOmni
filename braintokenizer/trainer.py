@@ -14,6 +14,7 @@ from accessor import DataAccessor
 from pretrain_dataset import (
     build_brain_bucket_dataloader,
     build_fixed_monitor_batch,
+    training_dataset_ids,
 )
 from factory.campaign import (
     CampaignContext,
@@ -34,7 +35,15 @@ from factory.lr_scheduler import warmup_cosine_scheduler_factory
 from braintokenizer.config import BrainTokenizerTrainerConfig
 from braintokenizer.model import BrainTokenizer
 from braintokenizer.metrics import MetricsComputer
-from factory.pretraining_monitor_runtime import StageOneAccumulator
+from factory.pretraining_integrity import (
+    nonfinite_gradient_names,
+    nonfinite_tensor_names,
+    warn_and_raise_distributed_failure,
+)
+from factory.pretraining_monitor_runtime import (
+    ExposureAccumulator,
+    StageOneAccumulator,
+)
 from factory.pretraining_monitors import (
     MONITOR_EPSILON,
     attention_similarity_statistics,
@@ -105,6 +114,9 @@ class Trainer:
         self.logger.info("=> Building val dataloader ...")
         self.val_loader = self.build_dataloader(
             mode="val", ratio=self.cfg.val_data_ratio
+        )
+        self.training_dataset_ids = training_dataset_ids(
+            self.cfg.pretrain_metadata_path
         )
 
         self.train_step_counter = 0
@@ -313,6 +325,9 @@ class Trainer:
         self.validation_epoch_monitor = StageOneAccumulator(
             self.cfg.codebook_size
         )
+        self.train_exposure_monitor = ExposureAccumulator(
+            self.training_dataset_ids
+        )
         self.train_running_dict = {
             "loss": 0.0,
             "time_loss": 0.0,
@@ -373,6 +388,11 @@ class Trainer:
 
     def train_step(self):
         input_dict = self.fetch_input_dict()
+        self._check_finite_inputs(input_dict)
+        self.train_exposure_monitor.update(
+            input_dict["dataset"],
+            input_dict["sensor_type"],
+        )
         boundary = self.model.is_gradient_accumulation_boundary()
         successful_before = successful_optimizer_steps(self.model)
         lightweight_due = monitor_due(
@@ -399,7 +419,9 @@ class Trainer:
         self.step_monitor.update(output_dict, monitor_data)
         self.train_epoch_monitor.update(output_dict, monitor_data)
         loss = output_dict["loss"]
+        self._check_finite_training_loss(loss)
         self.model.backward(loss)
+        self._check_finite_gradients()
         self.model.step()
         if boundary:
             successful_after = successful_optimizer_steps(self.model)
@@ -432,6 +454,7 @@ class Trainer:
     @torch.no_grad()
     def eval_step(self):
         input_dict = self.fetch_input_dict()
+        self._check_finite_inputs(input_dict)
         output_dict, _, monitor_data = self.model(
             **input_dict,
             return_monitor_data=True,
@@ -452,6 +475,41 @@ class Trainer:
     def _reduce_sum(self, value: torch.Tensor) -> None:
         """Sum one monitor sufficient statistic across all ranks."""
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
+
+    def _reduce_max(self, value: torch.Tensor) -> None:
+        """Take the maximum of one integrity failure flag across ranks."""
+        dist.all_reduce(value, op=dist.ReduceOp.MAX)
+
+    def _check_finite_inputs(self, input_dict) -> None:
+        """Stop collectively when a training or validation input is invalid."""
+        warn_and_raise_distributed_failure(
+            nonfinite_tensor_names(input_dict),
+            "pre-training inputs",
+            self.rank,
+            self.local_rank,
+            self._reduce_max,
+        )
+
+    def _check_finite_training_loss(self, loss: torch.Tensor) -> None:
+        """Stop collectively before backward propagation of invalid loss."""
+        warn_and_raise_distributed_failure(
+            nonfinite_tensor_names({"loss": loss}),
+            "training loss",
+            self.rank,
+            self.local_rank,
+            self._reduce_max,
+        )
+
+    def _check_finite_gradients(self) -> None:
+        """Stop collectively before an update with invalid gradients."""
+        module = getattr(self.model, "module", self.model)
+        warn_and_raise_distributed_failure(
+            nonfinite_gradient_names(module),
+            "training gradients",
+            self.rank,
+            self.local_rank,
+            self._reduce_max,
+        )
 
     def _codebook_snapshot(self) -> torch.Tensor:
         """Return an in-memory snapshot of all effective RVQ codebooks."""
@@ -598,6 +656,7 @@ class Trainer:
             )
         self.train_epoch_monitor.reduce_(self._reduce_sum)
         self.validation_epoch_monitor.reduce_(self._reduce_sum)
+        self.train_exposure_monitor.reduce_(self._reduce_sum)
         if self.rank == 0:
             write_scalars(
                 self.writer,
@@ -607,6 +666,11 @@ class Trainer:
             write_scalars(
                 self.writer,
                 self.validation_epoch_monitor.validation_values(),
+                self.epoch,
+            )
+            write_scalars(
+                self.writer,
+                self.train_exposure_monitor.values(),
                 self.epoch,
             )
         self.logger.info("")

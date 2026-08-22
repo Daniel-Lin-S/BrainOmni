@@ -24,6 +24,14 @@ class BrainDataset(torch.utils.data.Dataset):
         data["x"] = data["x"].to(PRETRAIN_DTYPE)
         data["pos"] = data["pos"].to(PRETRAIN_DTYPE)
         data["path"] = self.metadata_list[idx]["path"]
+        dataset = self.metadata_list[idx].get("dataset")
+        if dataset is not None:
+            if not isinstance(dataset, str) or not dataset:
+                raise ValueError(
+                    "Pre-training metadata has an invalid dataset identity: "
+                    f"{dataset!r}."
+                )
+            data["dataset"] = dataset
         return data
 
 
@@ -33,7 +41,54 @@ def collate_fn(batch):
         if isinstance(batch[0][key], torch.Tensor):
             data[key] = torch.stack([i[key] for i in batch])
     data["path"] = [i["path"] for i in batch]
+    if "dataset" in batch[0]:
+        datasets = [item.get("dataset") for item in batch]
+        if any(
+            not isinstance(dataset, str) or not dataset
+            for dataset in datasets
+        ):
+            raise ValueError(
+                "Each batch item must provide one non-empty dataset identity."
+            )
+        data["dataset"] = datasets
     return data
+
+
+def training_dataset_ids(metadata_path: str) -> tuple[str, ...]:
+    """Return sorted training dataset identifiers from resolved metadata.
+
+    Parameters
+    ----------
+    metadata_path : str
+        Directory containing the resolved ``train.json`` metadata.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Non-empty, sorted dataset identifiers used by the training split.
+    """
+    train_path = os.path.join(metadata_path, "train.json")
+    with open(train_path, "r", encoding="utf-8") as stream:
+        metadata = json.load(stream)
+    if not isinstance(metadata, list) or not metadata:
+        raise ValueError(
+            f"Training metadata is empty: {os.path.abspath(train_path)}."
+        )
+    datasets = []
+    for item in metadata:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "Training metadata must contain mappings, got "
+                f"{type(item).__name__}."
+            )
+        dataset = item.get("dataset")
+        if not isinstance(dataset, str) or not dataset:
+            raise ValueError(
+                "Training metadata requires non-empty dataset identities, got "
+                f"{dataset!r}."
+            )
+        datasets.append(dataset)
+    return tuple(sorted(set(datasets)))
 
 
 def build_fixed_monitor_batch(

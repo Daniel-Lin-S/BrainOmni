@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from urllib.parse import quote
 
 import torch
 
@@ -34,6 +35,150 @@ STAGE_ONE_LOSS_KEYS = (
 CORRUPTION_NAMES = ("dedicated_mask", "random_token")
 MODALITY_NAMES = ("eeg", "meg")
 EEG_SENSOR_TYPE = SENSOR_TYPE_DICT["EEG"]
+DATA_EXPOSURE_FAMILY = "data"
+DATASET_EXPOSURE_METRIC = "dataset_exposure_ratio"
+MODALITY_SAMPLE_EXPOSURE_METRIC = "modality_sample_exposure_ratio"
+MODALITY_CHANNEL_EXPOSURE_METRIC = "modality_channel_exposure_ratio"
+EXPOSURE_MODALITIES = (
+    ("eeg", SENSOR_TYPE_DICT["EEG"]),
+    ("mag", SENSOR_TYPE_DICT["MAG"]),
+    ("grad", SENSOR_TYPE_DICT["GRAD"]),
+)
+
+
+class ExposureAccumulator:
+    """Accumulate actual training dataset and modality exposure in memory."""
+
+    def __init__(self, dataset_ids: Sequence[str]) -> None:
+        if not dataset_ids:
+            raise ValueError(
+                "Exposure monitoring requires at least one dataset."
+            )
+        if any(
+            not isinstance(dataset, str) or not dataset
+            for dataset in dataset_ids
+        ):
+            raise ValueError(
+                "Exposure monitoring requires non-empty dataset identifiers."
+            )
+        if len(set(dataset_ids)) != len(dataset_ids):
+            raise ValueError(
+                "Exposure monitoring received duplicate dataset identifiers."
+            )
+        self.dataset_ids = tuple(dataset_ids)
+        self.sums = TensorSums()
+
+    def update(
+        self,
+        datasets: Sequence[str],
+        sensor_type: torch.Tensor,
+    ) -> None:
+        """Accumulate one actual training batch.
+
+        Parameters
+        ----------
+        datasets : Sequence[str]
+            Dataset identifier for each batch element.
+        sensor_type : torch.Tensor
+            Sensor categories with shape ``(batch, channels)``.
+        """
+        if sensor_type.ndim != 2:
+            raise ValueError(
+                "Expected sensor types with shape (batch, channels), got "
+                f"{tuple(sensor_type.shape)}."
+            )
+        if len(datasets) != sensor_type.shape[0]:
+            raise ValueError(
+                "Dataset identifiers must match the batch dimension: "
+                f"expected {sensor_type.shape[0]}, got {len(datasets)}."
+            )
+        counts = torch.zeros(
+            len(self.dataset_ids),
+            dtype=torch.float64,
+            device=sensor_type.device,
+        )
+        for dataset in datasets:
+            if dataset not in self.dataset_ids:
+                raise ValueError(
+                    "Training batch contains dataset outside the configured "
+                    f"exposure set: {dataset!r}."
+                )
+            counts[self.dataset_ids.index(dataset)] += 1
+        self.sums.add("dataset_count", counts)
+        self.sums.add("sample_count", counts.sum())
+        for modality, sensor_code in EXPOSURE_MODALITIES:
+            sensor_mask = sensor_type == sensor_code
+            self.sums.add(
+                f"{modality}_sample_count",
+                sensor_mask.any(dim=1).sum(),
+            )
+            self.sums.add(
+                f"{modality}_channel_count",
+                sensor_mask.sum(),
+            )
+
+    def reduce_(self, reduce_sum) -> None:
+        """Reduce actual-exposure sufficient statistics across ranks."""
+        self.sums.reduce_(reduce_sum)
+
+    def values(self) -> dict[str, torch.Tensor]:
+        """Return epoch-level TensorBoard scalars for actual exposure ratios."""
+        dataset_ratio = checked_ratio(
+            self.sums.require("dataset_count"),
+            self.sums.require("sample_count"),
+            "dataset exposure ratio",
+        )
+        values = {
+            canonical_tag(
+                "train",
+                "epoch",
+                DATA_EXPOSURE_FAMILY,
+                DATASET_EXPOSURE_METRIC,
+                quote(dataset, safe="._-"),
+            ): dataset_ratio[index]
+            for index, dataset in enumerate(self.dataset_ids)
+        }
+        eeg_channel_count = self.sums.require("eeg_channel_count")
+        meg_channel_count = (
+            self.sums.require("mag_channel_count")
+            + self.sums.require("grad_channel_count")
+        )
+        if eeg_channel_count > 0 and meg_channel_count > 0:
+            sample_total = self.sums.require("sample_count")
+            channel_total = sum(
+                self.sums.require(f"{modality}_channel_count")
+                for modality, _ in EXPOSURE_MODALITIES
+            )
+            for modality, _ in EXPOSURE_MODALITIES:
+                sample_count = self.sums.require(
+                    f"{modality}_sample_count"
+                )
+                channel_count = self.sums.require(
+                    f"{modality}_channel_count"
+                )
+                values[canonical_tag(
+                    "train",
+                    "epoch",
+                    DATA_EXPOSURE_FAMILY,
+                    MODALITY_SAMPLE_EXPOSURE_METRIC,
+                    modality,
+                )] = checked_ratio(
+                    sample_count,
+                    sample_total,
+                    f"{modality} sample exposure ratio",
+                )
+                values[canonical_tag(
+                    "train",
+                    "epoch",
+                    DATA_EXPOSURE_FAMILY,
+                    MODALITY_CHANNEL_EXPOSURE_METRIC,
+                    modality,
+                )] = checked_ratio(
+                    channel_count,
+                    channel_total,
+                    f"{modality} channel exposure ratio",
+                )
+        return values
 
 
 class StageOneAccumulator:
