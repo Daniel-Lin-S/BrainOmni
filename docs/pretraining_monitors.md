@@ -10,9 +10,6 @@ directory. Scalar tags written by new runs use
 `source_00`. Historical event files are not changed; the extraction interface
 maps their flat tags to this grammar at read time.
 
-Only scalar sufficient statistics and the existing reconstruction figures are
-persisted. Activations, attention matrices, code assignments, optimizer
-partitions, and parameter snapshots exist only transiently in memory.
 Training reconstruction figures use
 `train/micro_step/visualization/reconstruction`; final figures use
 `evaluation/visualization/reconstruction/<encoded-dataset>`.
@@ -21,41 +18,6 @@ Cadenced steps count successful DeepSpeed optimizer updates. Gradient
 accumulation micro-batches and skipped updates do not advance that count.
 The defaults are configured under `invocation.monitoring` and are saved in the
 attempt's `invocation.yaml`; they do not affect campaign identity.
-
-## Extracting scalar events
-
-Export one or more campaign or TensorBoard directories to long-form CSV only
-when needed:
-
-```bash
-python -m script.export_pretraining_monitors \
-  --event-dir /absolute/path/to/campaign-a \
-  --event-dir /absolute/path/to/campaign-b \
-  --output /absolute/path/to/monitors.csv
-```
-
-Python callers can use
-`factory.pretraining_monitor_events.load_monitor_events` directly. It returns
-rows with the run, original and normalized tags, tag components, optimizer or
-epoch step, wall time, and scalar value. It recursively discovers event files,
-and prefers a legacy `loss` event over a same-step `judge_loss` alias.
-
-For fully custom plotting, TensorBoard's API is also straightforward:
-
-```python
-from tensorboard.backend.event_processing.event_accumulator import (
-    EventAccumulator,
-)
-
-events = EventAccumulator(
-    "/absolute/path/to/events.out.tfevents.example",
-    size_guidance={"scalars": 0},
-)
-events.Reload()
-points = events.Scalars("train/step/objective/optimized_loss")
-steps = [point.step for point in points]
-values = [point.value for point in points]
-```
 
 ## Cadence conventions
 
@@ -195,7 +157,33 @@ BrainTokenizer uses sequential RVQ levels. Let:
 - \(r_l\) denote the residual entering RVQ level \(l\);
 - \(e_{q_l}\) denote the selected code vector.
 
-All RVQ monitors should be reported **separately for the four RVQ levels**.
+The commitment loss is a single scalar averaged across RVQ levels; the
+remaining RVQ monitors are reported **separately for each level**.
+
+### Commitment loss
+
+TensorBoard records `train/step/rvq/commitment_loss` (counts as lightweight computation),
+`train/epoch/rvq/commitment_loss`, and
+`validation/epoch/rvq/commitment_loss`.
+
+For the default `quantize_optimize_method: ema`, with \(L\) RVQ levels,
+
+\[
+L_{\mathrm{rvq}}=\frac{1}{L}\sum_{l=1}^{L}
+0.25\,\operatorname{MSE}(u_l,\operatorname{sg}(e_{q_l})),
+\]
+
+where \(u_l\) is the residual entering the level after its input projection
+(identity when latent and codebook dimensions match), and \(e_{q_l}\) is the
+selected code in that space. The initial RVQ input is the encoder latent normalised to unit L2 norm along its feature axis. MSE averages over **all batch, source, window, and feature elements**. This term encourages encoder outputs to stay close to their selected codes; EMA updates the codebook separately.
+
+With `quantize_optimize_method: simvq`, each level instead contributes
+\(\operatorname{MSE}(\operatorname{sg}(r_l),e_{q_l})
++0.25\,\operatorname{MSE}(r_l,\operatorname{sg}(e_{q_l}))\).
+The first term trains the codebook transform; the second trains the input
+representation. Both are included in the logged `commitment_loss`.
+
+### Per-level diagnostics
 
 | Monitor | Purpose | Mathematical definition | Cadence | Incremental cost |
 |---|---|---|---|---|
@@ -247,3 +235,96 @@ subsets separately; a mixed EMEG sample contributes to both strata. The
 latent-source stratification uses the original joint forward pass.
 
 The unigram and majority-token comparisons are particularly important for interpreting differences between RVQ levels: higher raw accuracy for one codebook does not necessarily imply that its tokens contain more predictable contextual structure if its marginal token distribution is also substantially more imbalanced.
+
+## Extracting scalar events
+
+Export one or more campaign or TensorBoard directories to long-form CSV only
+when needed:
+
+```bash
+python -m script.export_pretraining_monitors \
+  --event-dir /absolute/path/to/campaign-a \
+  --event-dir /absolute/path/to/campaign-b \
+  --output /absolute/path/to/monitors.csv
+```
+
+Python callers can use
+`factory.pretraining_monitor_events.load_monitor_events` directly. It returns
+rows with the run, original and normalized tags, tag components, optimizer or
+epoch step, wall time, and scalar value. It recursively discovers event files,
+and prefers a legacy `loss` event over a same-step `judge_loss` alias.
+
+For fully custom plotting, TensorBoard's API is also straightforward:
+
+```python
+from tensorboard.backend.event_processing.event_accumulator import (
+    EventAccumulator,
+)
+
+events = EventAccumulator(
+    "/absolute/path/to/events.out.tfevents.example",
+    size_guidance={"scalars": 0},
+)
+events.Reload()
+points = events.Scalars("train/step/objective/optimized_loss")
+steps = [point.step for point in points]
+values = [point.value for point in points]
+```
+
+## Training figures
+
+Render scalar histories for one provenanced attempt without rerunning training:
+
+```bash
+python -m script.visualize_pretraining \
+  --tensorboard-dir /absolute/path/to/campaign/attempts/attempt/tensorboard
+```
+
+By default, PNG and PDF figures are saved under the attempt's `visualisation/`
+directory beside `tensorboard/`. Use `--output-dir /absolute/path/to/figures`
+to override the destination. The command infers the stage from both stage
+fields in the campaign's `campaign_identity.json`. Optional `--stage`
+validates an explicit identifier against that provenance; missing or
+inconsistent provenance and stage mismatches are errors.
+
+| Directory | Figures |
+|---|---|
+| `losses/` | Training optimized total and weighted components, against optimizer step (epoch fallback) |
+| `reconstruction/all/` | Separate raw PCC, MAE and MSE figures against epoch, sharing training and validation curves |
+| `reconstruction/dropped_vs_visible/` | One figure per metric comparing dropped and visible channels; colour identifies channel group and line style identifies training or validation |
+| `reconstruction/{eeg,meg}/` | The same figures, only when selected campaign datasets include both modalities |
+| `latent_source/` | Separate validation inter-source correlation and effective-rank histories |
+| `rvq/` | Training normalized perplexity, utilization, quantization error and residual-energy reduction, each with one labelled line per level |
+
+The loss plot uses phase weight **0.5** and weight **1** for the other
+components. The optimized total is read directly from events. The logged PCC
+loss is `exp(-aggregated PCC)`; averaging and component weighting can mean the
+plotted components do not sum exactly to the recorded total. Curves are
+unsmoothed and retain their own recorded step or epoch coordinates.
+
+Epoch monitoring records PCC, MAE and MSE for both splits and all applicable
+reconstruction strata, using existing reduced statistics. MAE/MSE divide by
+signal-element count; raw PCC averages over traces with defined correlation.
+Empty strata or undefined PCC emit warnings and omit the affected metrics.
+Existing loss and stratum `time_loss` tags remain available.
+
+Historical runs may lack some curves. Equivalent L1 `time_loss` tags can supply
+MAE; missing MSE or other quantities are never fabricated. The command warns,
+annotates available figures, and omits wholly unavailable figures. It does not
+substitute normalized assignment entropy for normalized perplexity.
+
+`manifest.json` records campaign provenance, event-file paths, source tags,
+transformations, figure filenames and missing curves. Reruns replace generated
+figures and remove only stale figure files listed in the previous manifest;
+unrelated files are retained. Source events and checkpoints are unchanged.
+
+
+Channel dropping applies to both training and validation loss forwards. The
+encoder receives only visible channels, while the decoder reconstructs all
+channels against retained targets. This permits MAE, MSE and raw PCC for both
+channel groups on either split. Training additionally applies configured input
+noise; validation does not. Masks are sampled on each forward pass.
+
+Final testing uses `BrainTokenizer.visualize`, which encodes all input channels
+without channel dropping or input noise. Calling `model.eval()` alone does not
+disable channel dropping in the loss-producing `forward` method.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping, Sequence
 from urllib.parse import quote
 
@@ -389,6 +390,8 @@ class StageOneAccumulator:
         values.update(self._source_variance_values("train", cadence))
         if cadence != "epoch":
             return values
+        values.pop("train/epoch/reconstruction/pcc", None)
+        values.update(self._reconstruction_values("train"))
         assignment = assignment_metrics(
             self.sums.require("assignment_counts")
         )
@@ -427,50 +430,8 @@ class StageOneAccumulator:
         """Return Stage-1 validation metrics and compact strata."""
         values = self._objective_values("validation", "epoch")
         values.update(self._quantization_values("validation", "epoch"))
-        all_count = self.sums.require("all_element_count")
-        values[
-            canonical_tag(
-                "validation",
-                "epoch",
-                "reconstruction",
-                "mae",
-            )
-        ] = checked_ratio(
-            self.sums.require("all_absolute_sum"),
-            all_count,
-            "validation reconstruction MAE",
-        )
-        values[
-            canonical_tag(
-                "validation",
-                "epoch",
-                "reconstruction",
-                "mse",
-            )
-        ] = checked_ratio(
-            self.sums.require("all_squared_sum"),
-            all_count,
-            "validation reconstruction MSE",
-        )
-        values[
-            canonical_tag(
-                "validation",
-                "epoch",
-                "reconstruction",
-                "pcc",
-            )
-        ] = checked_ratio(
-            self.sums.require("all_pcc_sum"),
-            self.sums.require("all_pcc_count"),
-            "validation reconstruction PCC",
-        )
-        for stratum in ("dropped", "visible"):
-            self._add_reconstruction_stratum(values, stratum)
-        eeg_count = self.sums.require("eeg_element_count")
-        meg_count = self.sums.require("meg_element_count")
-        if eeg_count > 0 and meg_count > 0:
-            for stratum in MODALITY_NAMES:
-                self._add_reconstruction_stratum(values, stratum)
+        values.pop("validation/epoch/reconstruction/pcc", None)
+        values.update(self._reconstruction_values("validation"))
 
         covariance = covariance_from_sums(
             self.sums.require("source_count"),
@@ -518,39 +479,73 @@ class StageOneAccumulator:
         ] = entropy.mean()
         return values
 
-    def _add_reconstruction_stratum(
+    def _reconstruction_values(
         self,
-        values: dict[str, torch.Tensor],
-        stratum: str,
-    ) -> None:
-        element_count = self.sums.require(f"{stratum}_element_count")
-        pcc_count = self.sums.require(f"{stratum}_pcc_count")
-        values[
-            canonical_tag(
-                "validation",
-                "epoch",
-                "reconstruction",
-                "time_loss",
-                stratum,
-            )
-        ] = checked_ratio(
-            self.sums.require(f"{stratum}_absolute_sum"),
-            element_count,
-            f"{stratum} reconstruction time loss",
-        )
-        values[
-            canonical_tag(
-                "validation",
-                "epoch",
-                "reconstruction",
-                "pcc",
-                stratum,
-            )
-        ] = checked_ratio(
-            self.sums.require(f"{stratum}_pcc_sum"),
-            pcc_count,
-            f"{stratum} reconstruction PCC",
-        )
+        split: str,
+    ) -> dict[str, torch.Tensor]:
+        """Compute epoch quality from reduced element and valid-trace counts.
+
+        Parameters
+        ----------
+        split : str
+            Training or validation split used in the scalar tags.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Scalar PCC, MAE and MSE tensors for each populated stratum.
+            Historical stratum time-loss tags remain aliases of MAE.
+            Empty strata or undefined PCC emit warnings and omit the metric.
+        """
+        strata = ["all", "dropped", "visible"]
+        if all(
+            self.sums.require(f"{name}_element_count") > 0
+            for name in MODALITY_NAMES
+        ):
+            strata.extend(MODALITY_NAMES)
+        values = {}
+        for stratum in strata:
+            dimension = None if stratum == "all" else stratum
+            element_count = self.sums.require(f"{stratum}_element_count")
+            if element_count == 0:
+                warnings.warn(
+                    f"No {split} reconstruction elements for {stratum}; "
+                    "omitting epoch quality metrics for this stratum.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            metrics = {
+                "mae": ("absolute_sum", element_count),
+                "mse": ("squared_sum", element_count),
+                "pcc": (
+                    "pcc_sum",
+                    self.sums.require(f"{stratum}_pcc_count"),
+                ),
+            }
+            for metric, (statistic, count) in metrics.items():
+                if count == 0:
+                    warnings.warn(
+                        f"No valid {split} {stratum} traces for PCC; "
+                        "omitting the epoch PCC metric.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                value = checked_ratio(
+                    self.sums.require(f"{stratum}_{statistic}"),
+                    count,
+                    f"{split} {stratum} reconstruction {metric}",
+                )
+                values[canonical_tag(
+                    split, "epoch", "reconstruction", metric, dimension,
+                )] = value
+                if metric == "mae" and dimension is not None:
+                    values[canonical_tag(
+                        split, "epoch", "reconstruction", "time_loss",
+                        dimension,
+                    )] = value
+        return values
 
 
 class StageTwoAccumulator:

@@ -163,3 +163,19 @@ the warning gives the exact preprocessing command.
 Each preprocessing worker runs its MNE filtering and resampling steps with
 `n_jobs=1`. Parallelism comes only from `invocation.preprocess_workers`, which
 avoids nested joblib worker pools and their temporary-resource cleanup warnings.
+
+### Offline training visualisation
+
+The `script.visualize_pretraining` module renders one attempt's scalar histories
+into a sibling `visualisation/` directory. Pass `--tensorboard-dir ABSOLUTE_PATH`
+to select the input; `--output-dir ABSOLUTE_PATH` overrides the output.
+Stage is inferred from campaign provenance. Optional `--stage` validates
+an explicit identifier against that provenance. Figures and their manifest
+are attempt artifacts, not
+portable checkpoint contents or semantic campaign settings.
+
+Stage 1 records epoch PCC, MAE and MSE for training and validation, including
+dropped/visible channels and, for joint-modality runs, EEG/MEG strata. Existing
+statistics are reused without extra forward passes. Historical events may lack
+some curves; see [training monitors](pretraining_monitors.md#training-figures)
+for the figure layout and missing-metric handling.
