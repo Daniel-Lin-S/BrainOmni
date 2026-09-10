@@ -12,7 +12,10 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from braintokenizer.constants import DEFAULT_NOISE_STD
+from braintokenizer.constants import (
+    DEFAULT_NOISE_STD,
+    TRAINING_IMPLEMENTATION_VERSION,
+)
 
 COMMON_CAMPAIGN = {
     "stage",
@@ -135,6 +138,9 @@ def _apply_semantic_defaults(config: dict[str, Any]) -> None:
     objective = campaign.get("objective")
     if isinstance(objective, dict):
         objective.setdefault("noise_std", DEFAULT_NOISE_STD)
+        objective.setdefault(
+            "implementation_version", TRAINING_IMPLEMENTATION_VERSION
+        )
 
 
 def load_pretrain_launch_config(
@@ -502,9 +508,17 @@ def _validate_stage(campaign: dict[str, Any]) -> None:
             )
         objective = _mapping(
             objective,
-            {"channel_mask_ratio", "noise_std"},
+            {"channel_mask_ratio", "noise_std", "implementation_version"},
             "campaign.objective",
         )
+        version = objective["implementation_version"]
+        _integer(version, "campaign.objective.implementation_version", 1)
+        if version != TRAINING_IMPLEMENTATION_VERSION:
+            raise ConfigError(
+                "campaign.objective.implementation_version must equal "
+                f"{TRAINING_IMPLEMENTATION_VERSION}; legacy training "
+                "semantics cannot be resumed with this implementation."
+            )
         _fraction(
             objective["channel_mask_ratio"],
             "campaign.objective.channel_mask_ratio",

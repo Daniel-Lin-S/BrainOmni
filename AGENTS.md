@@ -10,6 +10,8 @@ Fine-tuning: A pre-trained BrainOmni model can be used for downstream classifica
 
 NEVER reveal local paths on public configuration files or scripts (this include tests). You should ALWAYS keep local paths, tokens in untracked files like `.local.yaml`.
 
+DO NOT document about technical details in development cycles. For example, if an initial implementation A is changed to B, DONT document "B is implemented, rather than A". You should ONLY document the current version (B) of the code. 
+
 ## Training artifacts and provenance
 
 ALL functional semantic configurations should be saved along with the outputs. (for both pre-training and fine-tuning)

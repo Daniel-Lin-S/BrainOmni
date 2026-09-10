@@ -81,6 +81,7 @@ Campaign settings are checkpoint-semantic and are saved in `pretrain_setting.yam
 | `campaign.model.quantize_optimize_method` | `ema`, `ema` | Codebook update method. |
 | `campaign.objective.channel_mask_ratio` | fraction [0,1), `.25` | Randomly hidden input-channel share; `0` hides none, while positive values require at least two channels. |
 | `campaign.objective.noise_std` | non-negative float, `.1` | Gaussian input-noise standard deviation used only during training. |
+| `campaign.objective.implementation_version` | integer, `2` | Materialized automatically; versions corrected EMA updates and circular phase loss. Legacy values are rejected. |
 | `campaign.optimizer.type` | `AdamW`, `AdamW` | Optimizer implementation. |
 | `campaign.optimizer.lr` | positive float, `2e-4` | Main parameter learning rate. |
 | `campaign.optimizer.codebook_lr` | positive float, `3e-4` | Learning rate for trainable quantizer projections; EMA codebook buffers are not optimized. |
@@ -168,7 +169,10 @@ avoids nested joblib worker pools and their temporary-resource cleanup warnings.
 
 The `script.visualize_pretraining` module renders one attempt's scalar histories
 into a sibling `visualisation/` directory. Pass `--tensorboard-dir ABSOLUTE_PATH`
-to select the input; `--output-dir ABSOLUTE_PATH` overrides the output.
+to select the attempt directory or its `tensorboard` subdirectory;
+`--output-dir ABSOLUTE_PATH` overrides the output. Direct execution with
+`python ABSOLUTE_SCRIPT_PATH --tensorboard-dir ABSOLUTE_PATH` is also supported
+from any working directory.
 Stage is inferred from campaign provenance. Optional `--stage` validates
 an explicit identifier against that provenance. Figures and their manifest
 are attempt artifacts, not
@@ -179,3 +183,14 @@ dropped/visible channels and, for joint-modality runs, EEG/MEG strata. Existing
 statistics are reused without extra forward passes. Historical events may lack
 some curves; see [training monitors](pretraining_monitors.md#training-figures)
 for the figure layout and missing-metric handling.
+
+## Versions
+
+Training with different BrainOmni versions create new compaigns. Legacy versions can still be restored by setting `implementation_version`.
+
+### Updates in version 2 (BrainTokenizer)
+
+Stage 1 now initializes EMA vector sums using k-means occupancy counts and
+revives dead codes after updating EMA state, resetting counts and sums together.
+Training and evaluation use the same circular phase distance in radians;
+Hamming windowing, equal frequency-bin weighting and loss weights are unchanged.

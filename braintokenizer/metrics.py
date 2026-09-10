@@ -1,9 +1,19 @@
+"""Aggregate reconstruction quality for normalized neural-signal windows.
+
+Inputs are matching tensors shaped ``(batch, channels, windows, samples)``
+and sensor categories shaped ``(batch, channels)``. Output mappings group
+scalar waveform and spectral metrics by modality. Spectral amplitude and
+circular phase errors use the same definitions as the training objective.
+"""
+
 import torch
+
+from model_utils.loss import get_frequency_domain_loss
 
 
 class MetricsComputer:
     """
-    assign this to a specific setting and it can be used to compute all the metrics
+    Accumulate reconstruction metrics for one evaluation setting.
     """
 
     def __init__(self):
@@ -39,7 +49,8 @@ class MetricsComputer:
                 torch.tensor([i[key] for i in self.record]).mean().item()
             )
             metrics["eeg"][key] = (
-                torch.tensor([i[key] for i in self.record if i["is_eeg"]]).mean().item()
+                torch.tensor([i[key] for i in self.record if i["is_eeg"]])
+                .mean().item()
             )
             metrics["meg"][key] = (
                 torch.tensor([i[key] for i in self.record if not i["is_eeg"]])
@@ -62,27 +73,38 @@ def compute_mse(rec, raw):
     return torch.mean(mse)
 
 
-def compute_amp(rec, raw):
-    window = torch.hamming_window(rec.shape[-1], device=rec.device)
+def compute_amp(rec: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+    """Return the training spectral amplitude error.
 
-    pred_fft = torch.fft.rfft(rec * window, dim=-1, norm="ortho")
-    target_fft = torch.fft.rfft(raw * window, dim=-1, norm="ortho")
+    Parameters
+    ----------
+    rec, raw : torch.Tensor
+        Matching waveforms shaped ``(batch, channels, windows, samples)``.
 
-    pred_magnitude = torch.abs(pred_fft)
-    target_magnitude = torch.abs(target_fft)
+    Returns
+    -------
+    torch.Tensor
+        Scalar mean absolute spectral amplitude difference.
+    """
+    amplitude, _ = get_frequency_domain_loss(rec, raw)
+    return amplitude
 
-    return compute_mae(pred_magnitude, target_magnitude)
 
+def compute_phase(rec: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+    """Return the training circular phase error.
 
-def compute_phase(rec, raw):
-    window = torch.hamming_window(rec.shape[-1], device=rec.device)
+    Parameters
+    ----------
+    rec, raw : torch.Tensor
+        Matching waveforms shaped ``(batch, channels, windows, samples)``.
 
-    pred_fft = torch.fft.rfft(rec * window, dim=-1, norm="ortho")
-    target_fft = torch.fft.rfft(raw * window, dim=-1, norm="ortho")
-
-    pred_phase = torch.angle(pred_fft)
-    target_phase = torch.angle(target_fft)
-    return compute_mae(pred_phase, target_phase)
+    Returns
+    -------
+    torch.Tensor
+        Scalar mean shortest angular difference in radians.
+    """
+    _, phase = get_frequency_domain_loss(rec, raw)
+    return phase
 
 
 def compute_pcc(rec: torch.Tensor, raw: torch.Tensor):
