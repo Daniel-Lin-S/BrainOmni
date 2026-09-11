@@ -150,7 +150,8 @@ def _evaluation_identity(
     dataset: str,
     evaluator_path: Path,
     metadata_path: Path,
-) -> dict[str, str]:
+    evaluation_settings: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     status = json.loads(
         (context.root / "campaign_status.json").read_text(encoding="utf-8")
     )
@@ -160,7 +161,7 @@ def _evaluation_identity(
     preprocessing = campaign_identity["semantic_payload"]["campaign"][
         "data"
     ]["preprocessing"]
-    return {
+    identity = {
         "campaign_sha256": context.identity_sha256,
         "dataset": dataset,
         "dataset_metadata_sha256": sha256_file(metadata_path),
@@ -169,12 +170,17 @@ def _evaluation_identity(
         "preprocessing_sha256": canonical_config_sha256(preprocessing),
     }
 
+    if evaluation_settings is not None:
+        identity["evaluation_settings"] = dict(evaluation_settings)
+    return identity
+
 
 def existing_evaluation_matches(
     context: CampaignContext,
     dataset: str,
     evaluator_path: Path,
     metadata_path: Path,
+    evaluation_settings: Mapping[str, Any] | None = None,
 ) -> bool:
     """Return whether an immutable matching evaluation already exists."""
     path = evaluation_metrics_path(context, dataset)
@@ -193,6 +199,7 @@ def existing_evaluation_matches(
         dataset,
         evaluator_path,
         metadata_path,
+        evaluation_settings,
     )
     if value.get("identity") != expected:
         raise CampaignHealthError(
@@ -209,14 +216,24 @@ def write_evaluation_metrics(
     metrics: Mapping[str, Any],
     evaluator_path: Path,
     metadata_path: Path,
+    evaluation_settings: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Create one immutable flat evaluation metrics artifact."""
+    """Create one immutable finite evaluation artifact with protocol identity."""
+    if not metrics:
+        raise ValueError("Evaluation metrics must not be empty.")
+    try:
+        json.dumps(metrics, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Evaluation metrics must contain finite JSON values: {error}"
+        ) from error
     path = evaluation_metrics_path(context, dataset)
     identity = _evaluation_identity(
         context,
         dataset,
         evaluator_path,
         metadata_path,
+        evaluation_settings,
     )
     with campaign_lock(context.root):
         if existing_evaluation_matches(
@@ -224,6 +241,7 @@ def write_evaluation_metrics(
             dataset,
             evaluator_path,
             metadata_path,
+            evaluation_settings,
         ):
             return path
         atomic_json(

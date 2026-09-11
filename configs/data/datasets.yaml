@@ -3,3 +3,4 @@ datasets:
   DATASET_ID:
     path: null
     signal_type: eeg
+    exclude_channel_types: []

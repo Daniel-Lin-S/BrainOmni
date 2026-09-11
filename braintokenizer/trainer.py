@@ -1,9 +1,10 @@
 import os
 from pathlib import Path
+from functools import partial
+from urllib.parse import quote
 
 import torch
 import logging
-from urllib.parse import quote
 import deepspeed
 import matplotlib.pyplot as plt
 import deepspeed.comm as dist
@@ -34,7 +35,12 @@ from factory.training_runtime import (
 from factory.lr_scheduler import warmup_cosine_scheduler_factory
 from braintokenizer.config import BrainTokenizerTrainerConfig
 from braintokenizer.model import BrainTokenizer
-from braintokenizer.metrics import MetricsComputer
+from braintokenizer.evaluation import (
+    EVALUATOR_PATH,
+    build_evaluation_loader,
+    evaluate_tokenizer,
+    evaluation_settings,
+)
 from factory.pretraining_integrity import (
     nonfinite_gradient_names,
     nonfinite_tensor_names,
@@ -57,6 +63,9 @@ from factory.pretraining_monitors import (
     write_scalars,
     zero_partition_snapshot,
 )
+
+
+EVALUATION_VISUALIZATION_INTERVAL = 10
 
 
 class EmptyLogger:
@@ -247,7 +256,11 @@ class Trainer:
 
     def _evaluate_requested_datasets(self):
         self.logger.info("=> Start Testing ...")
-        evaluator_path = Path(__file__).resolve()
+        evaluator_path = EVALUATOR_PATH
+        settings = evaluation_settings(
+            self.model.module, self.cfg.seed,
+            self.cfg.batch_size, self.world_size,
+        )
         for mode in self.cfg.evaluation_datasets:
             if not evaluation_metadata_available(
                 self.campaign,
@@ -266,41 +279,23 @@ class Trainer:
                 mode,
                 evaluator_path,
                 metadata_path,
+                settings,
             ):
                 self.logger.info("Verified existing evaluation for %s.", mode)
                 dist.barrier()
                 continue
-            self.test_loader = self.build_dataloader(mode=mode, ratio=1.0)
-            if len(self.test_loader) == 0:
-                raise RuntimeError(
-                    f"Evaluation loader for {mode!r} is empty despite "
-                    "non-empty metadata. Check distributed batch sizing."
-                )
-            self.metrics_computer = MetricsComputer()
-            for index, self.input_dict in enumerate(self.test_loader):
-                input_dict = self.fetch_input_dict()
-                output_dict = self.model.visualize(**input_dict)
-                self.metrics_computer.step(
-                    output_dict["x_rec"],
-                    output_dict["x"],
-                    output_dict["sensor_type"],
-                )
-                if index % 10 == 0:
-                    self.write_visualize_result(
-                        output_dict["x"],
-                        output_dict["x_rec"],
-                        tag=(
-                            "evaluation/visualization/reconstruction/"
-                            f"{quote(mode, safe='._-')}"
-                        ),
-                        global_step=index,
-                    )
-            metrics = self.metrics_computer.get_metrics()
-            for metric_group in metrics.values():
-                for key in metric_group:
-                    metric_group[key] = self.scalar_comm_reduce(
-                        metric_group[key]
-                    )
+            loader = build_evaluation_loader(
+                metadata_path, self.cfg.batch_size, self.cfg.num_workers,
+                self.rank, self.world_size,
+            )
+            metrics = evaluate_tokenizer(
+                self.model.module, loader, self.cfg.codebook_size,
+                self.cfg.seed + self.rank,
+                reduce_sum=self._reduce_sum, progress=self.rank == 0,
+                reconstruction_callback=partial(
+                    self._write_evaluation_reconstruction, mode,
+                ) if self.rank == 0 else None,
+            )
             if self.rank == 0:
                 path = write_evaluation_metrics(
                     self.campaign,
@@ -308,6 +303,7 @@ class Trainer:
                     metrics,
                     evaluator_path,
                     metadata_path,
+                    settings,
                 )
                 self.logger.info("Saved evaluation metrics to %s.", path)
             dist.barrier()
@@ -355,6 +351,20 @@ class Trainer:
                     device=self.local_rank, non_blocking=True
                 )
         return input_dict
+
+    def _write_evaluation_reconstruction(
+        self, dataset: str, index: int, output: dict[str, torch.Tensor],
+    ) -> None:
+        """Retain periodic held-out reconstruction figures in TensorBoard."""
+        if index % EVALUATION_VISUALIZATION_INTERVAL == 0:
+            self.write_visualize_result(
+                output["x"], output["x_rec"],
+                tag=(
+                    "evaluation/visualization/reconstruction/"
+                    f"{quote(dataset, safe='._-')}"
+                ),
+                global_step=index,
+            )
 
     def write_visualize_result(
         self,

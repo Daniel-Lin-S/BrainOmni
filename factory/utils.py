@@ -5,10 +5,10 @@ from pathlib import Path
 import random
 from typing import Any
 import warnings
+import logging
 import numpy as np
 import torch
 from factory.brain_constant import (
-    EXCLUDE_DICT,
     RENAME_DICT,
     HPI_LIST,
     MONTAGE_DICT,
@@ -17,31 +17,53 @@ from factory.brain_constant import (
 )
 from accessor import DataAccessor, write_torch_warpper
 
+from factory.channel_selection import channel_selection_provenance
+
 MNE_PREPROCESS_JOBS = 1
 
 
-def filter_channel(raw, dataset: str):
-    exclude = []
-    if dataset in EXCLUDE_DICT.keys():
-        exclude = list(EXCLUDE_DICT[dataset])
+def filter_channel(
+    raw: Any, dataset: str,
+    selection: dict[str, list[str]] | None = None,
+) -> Any:
+    """Select neural channels in place using catalog exclusions.
 
-    for i in ["HEO", "VEO", "EKG", "EMG"]:
-        if i in raw.info.ch_names and i not in exclude:
-            exclude.append(i)
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Recording with C channels after channel renaming.
+    dataset : str
+        Dataset ID selecting the existing fixed channel-name exclusions.
+    selection : dict[str, list[str]] or None, optional
+        Configured type exclusions, default None for no type exclusions.
+        Reference MEG and non-neural sensor types are always omitted.
 
-    if dataset == "Omega":
-        indices = mne.pick_types(
-            raw.info, meg=True, eeg=False, ref_meg=False, exclude=exclude
+    Returns
+    -------
+    mne.io.BaseRaw
+        The input recording restricted to retained neural channels.
+    """
+    policy = channel_selection_provenance(dataset, selection or {})
+    indices = mne.pick_types(
+        raw.info, meg=True, eeg=True, ref_meg=False,
+        exclude=policy["exclude_channels"],
+    )
+    channel_types = raw.get_channel_types()
+    indices = [index for index in indices
+               if channel_types[index] not in policy["exclude_channel_types"]]
+    if not indices:
+        raise ValueError(
+            "No EEG or MEG channels remain after catalog exclusions: "
+            f"{policy}."
         )
-    else:
-        indices = mne.pick_types(
-            raw.info, meg=True, eeg=True, ref_meg=False, exclude=exclude
-        )
-    raw.pick(indices)
+    raw.pick(indices, verbose="WARNING")
     return raw
 
 
-def infer_signal_type(raw: Any, dataset: str) -> str:
+def infer_signal_type(
+    raw: Any, dataset: str,
+    selection: dict[str, list[str]] | None = None,
+) -> str:
     """Return the retained EEG/MEG modality for one raw recording.
 
     Parameters
@@ -49,7 +71,9 @@ def infer_signal_type(raw: Any, dataset: str) -> str:
     raw : mne.io.BaseRaw
         Recording whose channels are selected in place.
     dataset : str
-        Dataset ID used by the shared channel-selection policy.
+        Dataset ID used in error messages.
+    selection : dict[str, list[str]] or None, optional
+        Catalog exclusions, default None for no explicit exclusions.
 
     Returns
     -------
@@ -61,7 +85,7 @@ def infer_signal_type(raw: Any, dataset: str) -> str:
     ValueError
         Raised when channel selection retains neither EEG nor MEG channels.
     """
-    filtered = filter_channel(raw, dataset)
+    filtered = filter_channel(raw, dataset, selection)
     eeg_indices = mne.pick_types(filtered.info, eeg=True)
     meg_indices = mne.pick_types(
         filtered.info,
@@ -297,7 +321,7 @@ def split_to_segments_save(
     end = int(start + TIME * sample_rate_hz)
     stride_length = int(STRIDE * sample_rate_hz)
     root_path = Path(dataset_root).resolve()
-    raw_path = Path(path).resolve()
+    raw_path = Path(path).absolute()
     try:
         relative_path = raw_path.relative_to(root_path)
     except ValueError as error:
@@ -370,16 +394,48 @@ def split_pretrain_metadata(
     data: list[dict[str, Any]],
     split_ratios: dict[str, float],
     training_datasets: list[str],
+    held_out_datasets: list[str] | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
     dict[str, list[dict[str, Any]]],
 ]:
-    """Split training metadata while isolating requested held-out datasets."""
+    """Partition training windows and keep requested held-out datasets whole.
+
+    Parameters
+    ----------
+    data : list[dict[str, Any]]
+        Prepared window records containing dataset identities and tensor paths.
+    split_ratios : dict[str, float]
+        Train, validation, and test fractions applied only to training data.
+    training_datasets : list[str]
+        Exclusive dataset IDs permitted in train/validation/test.
+    held_out_datasets : list[str] or None, optional
+        Whole-dataset outputs to select. Default None selects every observed
+        nontraining dataset; an explicit list ignores unrelated cached data.
+
+    Returns
+    -------
+    tuple
+        Train, validation, test lists and held-out lists keyed by dataset ID.
+        Missing requested held-out windows or overlapping selections raise.
+    """
     training_names = set(training_datasets)
     observed_names = {item["dataset"] for item in data}
-    held_out_names = observed_names - training_names
+    held_out_names = (
+        observed_names - training_names
+        if held_out_datasets is None else set(held_out_datasets)
+    )
+    overlap = training_names & held_out_names
+    if overlap:
+        raise ValueError(f"Training and held-out datasets overlap: {overlap}.")
+    missing = held_out_names - observed_names
+    if missing:
+        raise ValueError(
+            f"No preprocessed windows exist for requested held-out datasets: "
+            f"{sorted(missing)}. Check recording selection and preprocessing."
+        )
     held_out = {
         dataset: [item for item in data if item["dataset"] == dataset]
         for dataset in sorted(held_out_names)
@@ -413,10 +469,14 @@ def process(
     ready_path: str,
     TIME: int,
     STRIDE: int,
+    channel_selection: dict[str, list[str]] | None = None,
 ):
+    logging.getLogger("processor").info(
+        "dataset=%s: processing recording %s", dataset, Path(path).absolute(),
+    )
     raw = accessor.read_brain_file(path)
     raw = rename_channel(raw, dataset)
-    raw = filter_channel(raw, dataset)
+    raw = filter_channel(raw, dataset, channel_selection)
     raw = set_montage(raw, dataset)
     raw_duration_seconds = raw.n_times / raw.info["sfreq"]
 
@@ -468,7 +528,7 @@ def process(
         STRIDE,
     )
     root_path = Path(dataset_root).resolve()
-    raw_path = Path(path).resolve()
+    raw_path = Path(path).absolute()
     try:
         source_recording = raw_path.relative_to(root_path).as_posix()
     except ValueError as error:
@@ -477,6 +537,9 @@ def process(
         ) from error
     completion = {
         "recording_path": str(raw_path),
+        "channel_selection": channel_selection_provenance(
+            dataset, channel_selection or {}
+        ),
         "dataset": dataset,
         "source_recording": source_recording,
         "raw_duration_seconds": raw_duration_seconds,

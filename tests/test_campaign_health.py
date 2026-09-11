@@ -733,6 +733,47 @@ class CampaignHealthTest(unittest.TestCase):
                     downstream_brainomni.get_brainomni(ckpt_path=str(root))
             model_constructor.assert_not_called()
 
+    def test_evaluation_protocol_identity_and_finite_json(self) -> None:
+        """Reject incompatible reuse and non-finite evaluation artifacts."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign = self._campaign(
+                root, "braintokenizer", {"weight": torch.ones(2, 3)},
+            )
+            identity = json.loads(
+                (campaign / "campaign_identity.json").read_text()
+            )
+            context = CampaignContext(
+                root=campaign, attempt_root=campaign / "attempts" / "a",
+                attempt_id="a", stage="braintokenizer",
+                identity_sha256=identity["campaign_sha256"],
+                training_required=False,
+            )
+            evaluator = root / "evaluator.py"
+            evaluator.write_text("version = 1")
+            metadata = root / "held.json"
+            metadata.write_text('[{"dataset": "HELD"}]')
+            settings = {"seed": 42, "world_size": 1}
+            output = write_evaluation_metrics(
+                context, "HELD", {"loss": 1.0}, evaluator, metadata, settings,
+            )
+            original = output.read_bytes()
+            with self.assertRaises(CampaignHealthError):
+                write_evaluation_metrics(
+                    context, "HELD", {"loss": 1.0}, evaluator, metadata,
+                    {"seed": 43, "world_size": 1},
+                )
+            for invalid in ({}, {"loss": float("nan")}):
+                with self.assertRaises(ValueError):
+                    write_evaluation_metrics(
+                        context, "OTHER", invalid, evaluator, metadata,
+                    )
+            self.assertEqual(output.read_bytes(), original)
+            self.assertFalse(
+                (campaign / "evaluations" / "metrics_heldout_OTHER.json")
+                .exists()
+            )
+
     def test_evaluation_metrics_are_immutable(self) -> None:
         state = {"weight": torch.ones(2, 3)}
         with tempfile.TemporaryDirectory() as temporary:

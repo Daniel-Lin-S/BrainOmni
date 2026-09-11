@@ -11,6 +11,9 @@
 #
 # Output:
 #   Captures terminal output under the repository logs/preprocess directory.
+#   Preprocesses included_datasets and held_out_evaluation_datasets.
+#   Held-out metadata is separate from train/validation/test partitions.
+#   Dataset statistics are saved beside terminal.log in dataset_summary.json.
 #   Processed data and metadata locations come from the resolved invocation.
 
 set -euo pipefail
@@ -24,3 +27,7 @@ log_config_paths "$@"
 unset CUDA_VISIBLE_DEVICES
 run_with_terminal_log "${PYTHON_BIN}" -m factory.process "$@"
 move_terminal_log "complete"
+if [[ -f "${TERMINAL_LOG_DIRECTORY}/dataset_summary.json" ]]; then
+    write_terminal_log_message \
+        "Dataset summary: ${TERMINAL_LOG_DIRECTORY}/dataset_summary.json"
+fi

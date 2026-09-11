@@ -4,27 +4,72 @@ This is the public, authoritative schema reference for BrainTokenizer and BrainO
 
 ## 1. Configuration precedence and launch flow
 
-```bash
-bash script/train_braintokenizer.sh --num-gpus N --config configs/pretrain/braintokenizer.yaml LOCAL_FILE
-```
-
 All `--config` files merge left-to-right; repeatable `--set` overrides apply
-last. Validation runs only after the final complete merge.
+last. Validation runs only after the final complete merge. Run the commands
+below from the repository root, replacing `LOCAL_FILE` with your local overlay.
+
+### Dataset catalog
 
 The required local dataset catalog is auto-loaded from
 `configs/data/datasets.local.yaml`; users do not pass it at launch. Copy the
 tracked `configs/data/datasets.yaml` template and set each dataset's `path` and
 `signal_type` (`eeg`, `meg`, or `both`). The catalog is the sole modality
 source. `included_datasets: ["*"]` selects every catalog entry; an explicit
-list selects only those entries. Each selected root is independently scanned
-and every recording must match its catalog modality.
+list selects the training entries.
+
+Optional `exclude_channel_types` accepts the MNE types `eeg`, `mag`, and
+`grad`, and defaults to `[]`. Existing channel-name exclusions still apply.
+Reference MEG and non-neural sensor types are omitted automatically.
 
 ```yaml
 datasets:
-  MEG-MASC:
+  DATASET_ID:
     path: <local path>
     signal_type: meg
+    exclude_channel_types: [eeg]
 ```
+
+### Preprocessing
+
+Prepare the recordings before training, using the same configuration layers:
+
+```bash
+bash script/pretrain_preprocess.sh \
+  --config configs/pretrain/braintokenizer.yaml LOCAL_FILE
+```
+
+Preprocessing scans the union of `campaign.data.included_datasets` and
+`invocation.held_out_evaluation_datasets`. Held-out datasets receive the same
+preprocessing and separate whole-dataset JSON metadata; they never enter the
+training, validation, or test splits or change the training split identity.
+Unrequested catalog entries are not scanned. Missing requested held-out
+windows cause a clear error. Completion metadata records the actual channel
+exclusions. Cache reuse rejects changed or unrecorded exclusions; use fresh
+`processed_root` and `metadata_root` directories for changed settings.
+
+Raw discovery uses subject folders at BIDS roots and excludes nested
+`derivatives/` and hidden repository directories. MNE reads split FIF
+recordings through their first part. Every retained recording must match
+its catalog modality after applying the configured channel exclusions.
+
+The terminal log reports dataset discovery/header validation, recording
+processing progress, and datasets skipped because their recordings are already
+complete. Detailed statistics are saved in `dataset_summary.json` beside
+`terminal.log`, with separate `included_datasets` and `evaluation_datasets`
+aggregates and per-dataset summaries. Unselected cached datasets are excluded.
+An empty evaluation selection is marked `not_requested`.
+
+For Stage 2, pass the selected BrainOmni configuration and its local overlay
+to the same preprocessing command.
+
+### Training
+
+Train Stage 1 with the prepared BrainTokenizer configuration:
+
+```bash
+bash script/train_braintokenizer.sh --num-gpus N --config configs/pretrain/braintokenizer.yaml LOCAL_FILE
+```
+
 There is no generic Stage-2 default: select `brainomni_tiny.yaml` or
 `brainomni_base.yaml` explicitly.
 
@@ -164,6 +209,37 @@ the warning gives the exact preprocessing command.
 Each preprocessing worker runs its MNE filtering and resampling steps with
 `n_jobs=1`. Parallelism comes only from `invocation.preprocess_workers`, which
 avoids nested joblib worker pools and their temporary-resource cleanup warnings.
+
+### Held-out evaluation metrics
+
+Each evaluated dataset has a separate JSON file under the campaign's
+`evaluations/` directory. BrainTokenizer records unmasked reconstruction
+MAE, MSE, PCC, amplitude and circular phase errors, plus `validation_monitors`
+computed with validation channel masking. These include reconstruction strata,
+RVQ quantization error and assignment entropy, latent-source correlation and
+effective rank, and validation objective components. Inter-query attention
+similarity uses the first deterministic batch per rank, matching the fixed-batch
+validation diagnostic; its sample count is recorded separately. Training-only optimizer,
+gradient, update, exposure and codebook-drift diagnostics are excluded.
+Absent modalities are omitted; metrics must be finite. Counts are aggregated
+before division, and each held-out segment is evaluated once across ranks.
+The file records checkpoint/data identities, precision, masking seed and
+settings, and evaluator implementation hashes.
+
+For an existing exported BrainTokenizer, run from the repository root:
+
+```bash
+python -m braintokenizer.evaluate --attempt-dir ABSOLUTE_ATTEMPT_PATH --datasets DATASET_ID --device cuda:0
+```
+
+The command uses the saved metadata location, or `--metadata-dir` when supplied.
+An external metadata directory must contain `preprocessing.json` with a
+`preprocessing` mapping matching the saved campaign settings.
+Held-out tensors must use the campaign preprocessing. It never starts training
+or preprocessing. Missing metadata is recorded in the source attempt's
+`heldout_evaluation_status.json`; successful results live under `evaluations/`.
+Unique underscore/hyphen name variants resolve against the saved data catalog.
+Existing results are reused only when all recorded evaluation settings match.
 
 ### Offline training visualisation
 

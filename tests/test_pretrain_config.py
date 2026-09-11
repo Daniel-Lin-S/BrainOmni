@@ -22,7 +22,6 @@ from factory.export_pretrained import export_checkpoint
 from factory.process import (
     build_dataset_snapshots,
     discover_catalog_recordings,
-    log_dataset_snapshots,
     migrate_legacy_completion_records,
     read_finish_records,
 )
@@ -460,16 +459,19 @@ class PretrainConfigTest(unittest.TestCase):
             held_out_accessor = FakeAccessor()
             with mock.patch(
                 "factory.process.infer_signal_type",
-                return_value="eeg",
+                side_effect=["eeg", "meg"],
             ):
                 held_out_recordings = discover_catalog_recordings(
                     held_out_accessor,
                     config,
                 )
-            self.assertEqual(held_out_accessor.roots, [(str(eeg_root), "EEG")])
+            self.assertEqual(
+                held_out_accessor.roots,
+                [(str(eeg_root), "EEG"), (str(meg_root), "MEG")],
+            )
             self.assertEqual(
                 [recording["dataset"] for recording in held_out_recordings],
-                ["EEG"],
+                ["EEG", "MEG"],
             )
 
     def test_dataset_snapshots_cover_windows_and_recordings(self) -> None:
@@ -542,12 +544,6 @@ class PretrainConfigTest(unittest.TestCase):
             aggregate["channel_proportions"],
             {"eeg": 1 / 3, "meg": 1 / 3, "grad": 1 / 3},
         )
-        logger = logging.getLogger("preprocessing-summary-test")
-        with self.assertLogs(logger, level="INFO") as captured:
-            log_dataset_snapshots(logger, snapshots)
-        output = "\n".join(captured.output)
-        self.assertIn("snapshot aggregate: recordings=4", output)
-        self.assertIn("dataset=MEG", output)
         records, legacy_paths = read_finish_records(["/tmp/legacy.fif"])
         self.assertEqual(records, [])
         self.assertEqual(legacy_paths, ["/tmp/legacy.fif"])
@@ -891,6 +887,7 @@ class PretrainConfigTest(unittest.TestCase):
                     "DATASET_ID": {
                         "path": None,
                         "signal_type": "eeg",
+                        "exclude_channel_types": [],
                     }
                 }
             },

@@ -1,6 +1,8 @@
 from math import isfinite
 from statistics import median
 from collections import Counter
+from datetime import datetime, timezone
+from time import monotonic
 import os
 import json
 import logging
@@ -29,12 +31,17 @@ from pretrain_config import (
     preprocessing_directory,
     resolve_dataset_identities,
     selected_data_catalog,
+    sha256_file,
 )
+
+from factory.channel_selection import channel_selection_provenance
 
 FINISH_SCHEMA_VERSION = 2
 SNAPSHOT_SCHEMA_VERSION = 1
 WINDOW_MODALITIES = ("eeg", "meg", "emeg")
 CHANNEL_TYPES = ("eeg", "meg", "grad")
+PROGRESS_INTERVAL_SECONDS = 30
+SUMMARY_FILENAME = "dataset_summary.json"
 
 
 def seed_everything(seed):
@@ -51,10 +58,11 @@ def seed_everything(seed):
 def describe_recording_channels(
     raw: Any,
     dataset: str,
+    selection: dict[str, list[str]] | None = None,
 ) -> tuple[int, int, int]:
     """Return the retained EEG, magnetometer, and GRAD channel counts."""
     raw = rename_channel(raw, dataset)
-    raw = filter_channel(raw, dataset)
+    raw = filter_channel(raw, dataset, selection)
     raw = set_montage(raw, dataset)
     _, sensor_type = extract_pos_sensor_type(raw.info)
     eeg_mask, mag_mask, grad_mask, _ = get_sensor_type_mask(sensor_type)
@@ -70,28 +78,43 @@ def discover_catalog_recordings(
     config: dict,
 ) -> list[dict[str, object]]:
     """Discover and validate recordings from every selected catalog root."""
-    catalog = selected_data_catalog(config)
+    catalog = selected_data_catalog(config, include_held_out=True)
     recordings: list[dict[str, object]] = []
+    logger = logging.getLogger("processor")
     for dataset, definition in catalog.items():
         root = Path(definition["path"]).resolve()
         if not root.is_dir():
             raise ConfigError(f"Data catalog root is not a directory: {root}")
+        selection = channel_selection_provenance(dataset, definition)
+        logger.info("dataset=%s: discovering recordings in %s", dataset, root)
         dataset_files = accessor.search_brain_files(str(root), dataset)
         if not dataset_files:
             raise ConfigError(
                 f"No supported recordings exist below data catalog root: {root}"
             )
-        for recording in dataset_files:
+        logger.info(
+            "dataset=%s: validating %d recording headers",
+            dataset, len(dataset_files),
+        )
+        removed_compensation = 0
+        last_progress = monotonic()
+        for index, recording in enumerate(dataset_files, start=1):
             raw = None
             try:
                 raw = accessor.read_brain_file(
                     recording["path"],
                     preload=False,
                 )
-                observed = infer_signal_type(raw, dataset)
                 raw_sample_rate_hz = float(raw.info["sfreq"])
                 raw_samples = int(raw.n_times)
-                channel_counts = describe_recording_channels(raw, dataset)
+                prior_comps = len(raw.info.get("comps", []))
+                channel_counts = describe_recording_channels(
+                    raw, dataset, selection,
+                )
+                removed_compensation += bool(
+                    prior_comps and not raw.info.get("comps", [])
+                )
+                observed = infer_signal_type(raw, dataset, selection)
                 if (
                     not isfinite(raw_sample_rate_hz)
                     or raw_sample_rate_hz <= 0
@@ -115,6 +138,7 @@ def discover_catalog_recordings(
                     f"Dataset {dataset} declares {definition['signal_type']}, "
                     f"but {recording['path']} retains {observed} channels."
                 )
+            recording["channel_selection"] = selection
             recording["dataset_root"] = str(root)
             recording["signal_type"] = observed
             recording["raw_sample_rate_hz"] = raw_sample_rate_hz
@@ -125,7 +149,53 @@ def discover_catalog_recordings(
                 recording["grad_channels"],
             ) = channel_counts
             recordings.append(recording)
+            if monotonic() - last_progress >= PROGRESS_INTERVAL_SECONDS:
+                logger.info(
+                    "dataset=%s: validated headers %d/%d",
+                    dataset, index, len(dataset_files),
+                )
+                last_progress = monotonic()
+        logger.info(
+            "dataset=%s: header validation complete (%d recordings)",
+            dataset, len(dataset_files),
+        )
+        if removed_compensation:
+            logger.info(
+                "dataset=%s: channel selection removed unusable compensation "
+                "metadata from %d recording headers after excluding required "
+                "reference channels",
+                dataset, removed_compensation,
+            )
     return recordings
+
+
+
+def validate_cached_channel_selection(
+    records: list[dict[str, object]], config: dict,
+) -> None:
+    """Reject cached recordings with different or unrecorded exclusions.
+
+    Parameters
+    ----------
+    records : list[dict[str, object]]
+        Completion records with dataset IDs and channel_selection mappings.
+    config : dict
+        Resolved launch configuration containing the selected catalog entries.
+    """
+    catalog = selected_data_catalog(config, include_held_out=True)
+    for record in records:
+        dataset = record["dataset"]
+        if dataset not in catalog:
+            continue
+        expected = channel_selection_provenance(dataset, catalog[dataset])
+        observed = record.get("channel_selection")
+        if observed != expected:
+            raise ConfigError(
+                f"Cached channel selection for {dataset} is {observed!r}, "
+                f"but the catalog requests {expected!r}. Use fresh "
+                "processed_root and metadata_root directories, or migrate "
+                "completion provenance only after verifying the old settings."
+            )
 
 
 def read_finish_records(
@@ -485,47 +555,134 @@ def migrate_legacy_completion_records(
     return completions
 
 
-def log_dataset_snapshots(
-    logger: logging.Logger,
-    snapshots: dict[str, object],
-) -> None:
-    """Log aggregate and deterministic per-dataset snapshots."""
-    aggregate = snapshots.get("aggregate")
-    datasets = snapshots.get("datasets")
-    if not isinstance(aggregate, dict) or not isinstance(datasets, dict):
-        raise ConfigError("Dataset snapshots have an invalid structure.")
-    log_snapshot(logger, "aggregate", aggregate)
-    for dataset, snapshot in sorted(datasets.items()):
-        if not isinstance(dataset, str) or not isinstance(snapshot, dict):
+def build_grouped_dataset_summary(
+    records: list[dict[str, object]],
+    windows: list[dict[str, object]],
+    config: dict,
+) -> dict[str, object]:
+    """Summarize selected pretraining and evaluation datasets independently.
+
+    Parameters
+    ----------
+    records : list[dict[str, object]]
+        Completion records with source identities, durations and window counts.
+    windows : list[dict[str, object]]
+        Window metadata containing dataset, source and retained channel counts.
+    config : dict
+        Resolved configuration selecting training and held-out dataset IDs.
+
+    Returns
+    -------
+    dict[str, object]
+        Preprocessing settings and two sections, included_datasets and
+        evaluation_datasets, each with aggregate and per-dataset statistics.
+        An unrequested evaluation section has state=not_requested and no
+        numerical aggregate. Unselected cached datasets are excluded.
+    """
+    groups = {
+        "included_datasets": sorted(selected_data_catalog(config)),
+        "evaluation_datasets": sorted(
+            config["invocation"]["held_out_evaluation_datasets"]
+        ),
+    }
+    if set(groups["included_datasets"]) & set(groups["evaluation_datasets"]):
+        raise ConfigError("Pretraining and evaluation summary groups overlap.")
+    result = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "preprocessing": config["campaign"]["data"]["preprocessing"],
+    }
+    for group, datasets in groups.items():
+        if not datasets:
+            result[group] = {
+                "state": "not_requested", "aggregate": None, "datasets": {},
+            }
+            continue
+        selected_records = [r for r in records if r["dataset"] in datasets]
+        missing = set(datasets) - {r["dataset"] for r in selected_records}
+        if missing:
             raise ConfigError(
-                "Dataset snapshots have an invalid dataset entry."
+                f"No completion records for {group}: {sorted(missing)}."
             )
-        log_snapshot(logger, f"dataset={dataset}", snapshot)
+        snapshots = build_dataset_snapshots(
+            selected_records, [w for w in windows if w["dataset"] in datasets],
+        )
+        result[group] = {
+            "state": "complete",
+            "aggregate": snapshots["aggregate"],
+            "datasets": snapshots["datasets"],
+            "channel_selection": {
+                name: channel_selection_provenance(
+                    name, config["invocation"]["data_catalog"][name],
+                ) for name in datasets
+            },
+        }
+    return result
 
 
-def log_snapshot(
+def write_dataset_summary(
+    summary: dict[str, object], directory: Path,
+) -> Path:
+    """Write a finite JSON summary beside the run's terminal log.
+
+    Parameters
+    ----------
+    summary : dict[str, object]
+        Two-group dataset summary including actual preprocessing settings.
+    directory : Path
+        Run log directory. The launcher moves its entire contents on completion.
+
+    Returns
+    -------
+    Path
+        Absolute dataset_summary.json path.
+    """
+    text = json.dumps(summary, indent=4, allow_nan=False) + "\n"
+    directory = directory.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / SUMMARY_FILENAME
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def select_pending_recordings(
+    recordings: list[dict[str, object]], completed_paths: set[str],
     logger: logging.Logger,
-    label: str,
-    snapshot: dict[str, object],
-) -> None:
-    """Log one already validated preprocessing snapshot."""
-    logger.info(
-        "preprocessing snapshot %s: recordings=%s raw_duration_seconds=%s "
-        "preprocessed_duration_seconds=%s generated_windows=%s",
-        label,
-        snapshot["completed_recordings"],
-        snapshot["raw_duration_seconds"],
-        snapshot["preprocessed_duration_seconds"],
-        snapshot["generated_windows"],
-    )
-    logger.info(
-        "preprocessing snapshot %s: window_channels=%s "
-        "window_modalities=%s channel_proportions=%s",
-        label,
-        snapshot["window_channel_count"],
-        snapshot["window_modality_proportions"],
-        snapshot["channel_proportions"],
-    )
+) -> list[dict[str, object]]:
+    """Select pending recordings and report cache reuse for each dataset.
+
+    Parameters
+    ----------
+    recordings : list[dict[str, object]]
+        Validated recording headers containing dataset IDs and absolute paths.
+    completed_paths : set[str]
+        Canonical paths already processed under verified settings.
+    logger : logging.Logger
+        Parent process logger receiving dataset-scoped status messages.
+
+    Returns
+    -------
+    list[dict[str, object]]
+        Only recordings needing signal preprocessing.
+    """
+    totals = Counter(row["dataset"] for row in recordings)
+    pending = [row for row in recordings
+               if str(Path(row["path"]).resolve()) not in completed_paths]
+    pending_counts = Counter(row["dataset"] for row in pending)
+    for dataset, total in sorted(totals.items()):
+        count = pending_counts[dataset]
+        if not count:
+            logger.info(
+                "dataset=%s: skipped signal preprocessing; all %d "
+                "recordings already complete", dataset, total,
+            )
+        else:
+            logger.info(
+                "dataset=%s: %d recordings to preprocess; %d/%d already "
+                "complete and skipped", dataset, count, total - count, total,
+            )
+    return pending
 
 
 def get_logger():
@@ -539,7 +696,8 @@ def get_logger():
     screenHandler = logging.StreamHandler()
     screenHandler.setLevel(logging.INFO)
     screenHandler.setFormatter(formatter)
-    logger.addHandler(screenHandler)
+    if not logger.handlers:
+        logger.addHandler(screenHandler)
 
     return logger
 
@@ -548,6 +706,16 @@ def parse_arg():
     parser = argparse.ArgumentParser("")
     parser.add_argument("--config", nargs="+", required=True)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
+    terminal = os.environ.get("BRAINOMNI_TERMINAL_LOG_PATH")
+    log_directory = (
+        Path(terminal).resolve().parent if terminal
+        else Path(__file__).resolve().parents[1] / "logs" / "preprocess"
+        / "manual" / (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            + f"-{os.getpid()}"
+        )
+    )
+    parser.add_argument("--summary-dir", type=Path, default=log_directory)
     args = parser.parse_args()
     return args
 
@@ -626,16 +794,24 @@ if __name__ == "__main__":
         )
         logger.info("migrated legacy completion metadata.")
 
+    validate_cached_channel_selection(completion_records, config)
     logger.info("filtering brain files...")
-    brain_files = [
-        item for item in brain_files
-        if str(Path(item["path"]).resolve()) not in completed_paths
-    ]
+    brain_files = select_pending_recordings(
+        brain_files, completed_paths, logger,
+    )
 
-    logger.info("start processing...")
+    if brain_files:
+        logger.info("start processing...")
+    else:
+        logger.info("All selected recordings are cached; no signal processing.")
     counter = 0
     failures = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    pending_counts = Counter(row["dataset"] for row in brain_files)
+    finished_counts: Counter[str] = Counter()
+    last_progress = {dataset: monotonic() for dataset in pending_counts}
+    with ProcessPoolExecutor(
+        max_workers=max_workers, initializer=get_logger,
+    ) as executor:
         futures = {}
         for recording in brain_files:
             future = executor.submit(
@@ -651,14 +827,28 @@ if __name__ == "__main__":
                 processed_pretrain_path,
                 TIME,
                 STRIDE,
+                recording["channel_selection"],
             )
-            futures[future] = recording["path"]
+            futures[future] = recording
         for future in as_completed(futures):
             try:
                 segments_metadata, completion = future.result()
                 metadata_list += segments_metadata
                 completion_records.append(completion)
                 counter += 1
+                dataset = completion["dataset"]
+                finished_counts[dataset] += 1
+                done, total = finished_counts[dataset], pending_counts[dataset]
+                if (
+                    done == total
+                    or monotonic() - last_progress[dataset]
+                    >= PROGRESS_INTERVAL_SECONDS
+                ):
+                    logger.info(
+                        "dataset=%s: signal preprocessing completed %d/%d "
+                        "recordings", dataset, done, total,
+                    )
+                    last_progress[dataset] = monotonic()
                 if counter % 1000 == 0:
                     with open(finish_path, "w") as f:
                         json.dump(finish_payload(completion_records), f)
@@ -666,11 +856,11 @@ if __name__ == "__main__":
                         json.dump(metadata_list, f)
 
             except Exception as error:
-                recording_path = futures[future]
+                recording_path = futures[future]["path"]
                 failures.append((recording_path, str(error)))
                 logger.error(
-                    "Failed to preprocess %s: %s",
-                    Path(recording_path).resolve(),
+                    "dataset=%s: failed to preprocess %s: %s",
+                    futures[future]["dataset"], Path(recording_path).resolve(),
                     error,
                 )
 
@@ -703,6 +893,7 @@ if __name__ == "__main__":
         metadata_list,
         config["campaign"]["data"]["split_ratios"],
         config["campaign"]["data"]["included_datasets"],
+        invocation["held_out_evaluation_datasets"],
     )
     with open(os.path.join(pretrain_metadata_path, "train.json"), "w") as f:
         json.dump(train, f, indent=4)
@@ -715,4 +906,12 @@ if __name__ == "__main__":
             os.path.join(pretrain_metadata_path, f"{dataset}.json"), "w"
         ) as f:
             json.dump(dataset_metadata, f, indent=4)
-    log_dataset_snapshots(logger, snapshots)
+    summary = build_grouped_dataset_summary(
+        completion_records, metadata_list, config,
+    )
+    summary["source_metadata"] = {
+        "finish_sha256": sha256_file(Path(finish_path)),
+        "info_sha256": sha256_file(Path(info_path)),
+    }
+    summary_path = write_dataset_summary(summary, args.summary_dir)
+    logger.info("Dataset summary saved to %s", summary_path)

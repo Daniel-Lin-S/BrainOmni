@@ -1,4 +1,14 @@
+"""Read raw neural recordings and prepared tensor or JSON artifacts.
+
+Recording discovery walks a configured root, excluding hidden directories
+and nested derivatives. BIDS roots select subject directories only. CTF .ds
+directories are recording containers; FIF
+split continuations are opened through the first split by MNE. An explicitly
+configured derivative root can be used directly. Paths returned are absolute.
+"""
+
 import os
+import re
 import io
 import mne
 import json
@@ -9,10 +19,23 @@ from constant import DATA_ROOT_PATH
 from tqdm import tqdm
 
 
-def is_useful_path(x):
-    if "empty" in x or "noise" in x or '"split-02_meg.fif' in x or "hz.ds" in x:
+BIDS_DESCRIPTION_NAME = "dataset_description.json"
+BIDS_SUBJECT_PREFIX = "sub-"
+EXCLUDED_RECORDING_DIRECTORIES = frozenset({"derivatives"})
+FIF_SPLIT_PATTERN = re.compile(r"(?:^|_)split-(\d+)_")
+FIRST_FIF_SPLIT = 1
+
+
+def is_useful_path(name: str) -> bool:
+    """Reject noise recordings and FIF parts MNE reads via the first split."""
+    lower = name.lower()
+    if any(marker in lower for marker in ("empty", "noise", "hz.ds")):
         return False
-    return True
+    split = FIF_SPLIT_PATTERN.search(lower)
+    return not (
+        lower.endswith(".fif") and split
+        and int(split.group(1)) > FIRST_FIF_SPLIT
+    )
 
 
 def load_torch_warpper(path):
@@ -79,30 +102,36 @@ class DataAccessor:
             Recording mappings with ``path`` and catalog ``dataset`` fields.
         """
         brain_files: list[dict[str, str]] = []
-        for root, dir, name in tqdm(os.walk(root_path)):
-            if len(name) > 0:
-                for i in name:
-                    extension = i.rsplit(".", 1)[-1].lower()
-                    if (
-                        extension in self.brain_read_func_dict
-                        and is_useful_path(i)
-                    ):
-                        brain_files.append(
-                            {
-                                "path": os.path.join(root, i),
-                                "dataset": dataset,
-                            }
-                        )
-            if len(dir) > 0:
-                for i in dir:
-                    extension = i.rsplit(".", 1)[-1].lower()
-                    if extension == "ds" and is_useful_path(i):
-                        brain_files.append(
-                            {
-                                "path": os.path.join(root, i),
-                                "dataset": dataset,
-                            }
-                        )
+        root_path = str(Path(root_path).resolve())
+        bids_root = (Path(root_path) / BIDS_DESCRIPTION_NAME).is_file()
+        for root, directories, names in tqdm(os.walk(root_path)):
+            if root == root_path and bids_root:
+                directories[:] = [
+                    name for name in directories
+                    if name.startswith(BIDS_SUBJECT_PREFIX)
+                ]
+                names = []
+            directories[:] = sorted(
+                name for name in directories
+                if not name.startswith(".")
+                and name not in EXCLUDED_RECORDING_DIRECTORIES
+            )
+            containers = [
+                name for name in directories if name.lower().endswith(".ds")
+            ]
+            directories[:] = [
+                name for name in directories if name not in containers
+            ]
+            for name in sorted([*names, *containers]):
+                extension = name.rsplit(".", 1)[-1].lower()
+                if (
+                    not name.startswith(".")
+                    and extension in self.brain_read_func_dict
+                    and is_useful_path(name)
+                ):
+                    brain_files.append({
+                        "path": os.path.join(root, name), "dataset": dataset,
+                    })
         return brain_files
 
     def read_brain_file(self, path: str, preload: bool = True) -> Any:

@@ -28,6 +28,7 @@ import torch
 import yaml
 
 from pretrain_config import ConfigError, selected_data_catalog, sha256_file
+from factory.channel_selection import channel_selection_provenance
 
 ARTIFACT_SCHEMA_VERSION = 1
 CAMPAIGN_HASH_LENGTH = 20
@@ -218,6 +219,10 @@ def _semantic_payload(
     datasets = campaign["data"]["included_datasets"]
     campaign["data"]["dataset_signal_types"] = {
         dataset: catalog[dataset]["signal_type"] for dataset in datasets
+    }
+    campaign["data"]["dataset_channel_selection"] = {
+        dataset: channel_selection_provenance(dataset, catalog[dataset])
+        for dataset in datasets
     }
     payload: dict[str, Any] = {
         "configuration_schema_version": config["schema_version"],

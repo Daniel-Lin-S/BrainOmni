@@ -17,6 +17,7 @@ class BrainTokenizerTrainerConfig:
         optimizer = campaign["optimizer"]
         self.settings = settings
         self.exp_name = invocation["run_name"]
+        self.seed = campaign["seed"]
         self.pretrain_metadata_path = str(metadata_directory(settings))
         self.window_length = model["window_length"]
         self.n_filters = model["n_filters"]

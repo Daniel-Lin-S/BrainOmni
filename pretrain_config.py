@@ -17,6 +17,11 @@ from braintokenizer.constants import (
     TRAINING_IMPLEMENTATION_VERSION,
 )
 
+from factory.channel_selection import (
+    CHANNEL_SELECTION_KEYS,
+    resolve_channel_selection,
+)
+
 COMMON_CAMPAIGN = {
     "stage",
     "seed",
@@ -155,7 +160,7 @@ def load_pretrain_launch_config(
     )
 
 
-def load_data_catalog(path: str | Path) -> dict[str, dict[str, str]]:
+def load_data_catalog(path: str | Path) -> dict[str, dict[str, Any]]:
     """Load and validate one local dataset-path catalog."""
     catalog_path = Path(path)
     if not catalog_path.is_file():
@@ -174,7 +179,7 @@ def load_data_catalog(path: str | Path) -> dict[str, dict[str, str]]:
 def selected_data_catalog(
     config: Mapping[str, Any],
     include_held_out: bool = False,
-) -> dict[str, dict[str, str]]:
+) -> dict[str, dict[str, Any]]:
     """Return selected dataset definitions from a validated catalog."""
     catalog = config["invocation"]["data_catalog"]
     selected = config["campaign"]["data"]["included_datasets"]
@@ -571,7 +576,18 @@ def _validate_data_catalog(catalog: Mapping[str, Any]) -> None:
                 f"hyphens; got {dataset!r}. Update "
                 f"{DATA_CATALOG_PATH.resolve()} and retry."
             )
-        entry = _mapping(definition, {"path", "signal_type"}, dataset)
+        if not isinstance(definition, dict):
+            raise ConfigError(f"Expected catalog mapping for {dataset}.")
+        entry = dict(definition)
+        for key in CHANNEL_SELECTION_KEYS:
+            entry.setdefault(key, [])
+        _mapping(
+            entry, {"path", "signal_type"} | CHANNEL_SELECTION_KEYS, dataset,
+        )
+        try:
+            definition.update(resolve_channel_selection(entry))
+        except ValueError as error:
+            raise ConfigError(f"Data catalog {dataset}: {error}") from error
         path = entry["path"]
         if not isinstance(path, str) or not path:
             raise ConfigError(
@@ -773,6 +789,13 @@ def metadata_directory(config: Mapping[str, Any]) -> Path:
         "seed": config["campaign"]["seed"],
         "split_ratios": config["campaign"]["data"]["split_ratios"],
     }
+    selections = {}
+    for dataset, definition in catalog.items():
+        policy = resolve_channel_selection(definition)
+        if any(policy.values()):
+            selections[dataset] = policy
+    if selections:
+        split_identity["channel_selection"] = selections
     digest = canonical_config_sha256(split_identity)[:12]
     return preprocessing_directory(config) / f"splits_{digest}"
 
