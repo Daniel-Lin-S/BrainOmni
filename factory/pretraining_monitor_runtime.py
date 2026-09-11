@@ -588,6 +588,10 @@ class StageTwoAccumulator:
                 torch.zeros_like(monitor["cross_entropy_sum"]),
             )
             self.sums.add(
+                f"{modality}_correct_sum",
+                torch.zeros_like(monitor["correct_sum"]),
+            )
+            self.sums.add(
                 f"{modality}_count",
                 torch.zeros_like(masked_count),
             )
@@ -597,13 +601,24 @@ class StageTwoAccumulator:
         modality: str,
         monitor: Mapping[str, torch.Tensor],
     ) -> None:
-        """Accumulate an additional modality-specific validation forward."""
+        """Accumulate statistics from an existing modality validation pass.
+
+        Parameters
+        ----------
+        modality : str
+            EEG or MEG key identifying the modality-only input pass.
+        monitor : Mapping[str, torch.Tensor]
+            Per-RVQ CE sums and correct-token counts, each of shape (Q,),
+            and a scalar masked-token count shared by the Q active levels.
+            Sums are reduced across batches and ranks before division.
+        """
         if modality not in MODALITY_NAMES:
             raise ValueError(f"Unknown modality monitor {modality!r}.")
         self.sums.add(
             f"{modality}_cross_entropy_sum",
             monitor["cross_entropy_sum"],
         )
+        self.sums.add(f"{modality}_correct_sum", monitor["correct_sum"])
         self.sums.add(f"{modality}_count", monitor["masked_count"])
 
     def reduce_(self, reduce_sum) -> None:
@@ -770,21 +785,18 @@ class StageTwoAccumulator:
         )
         if modality_available:
             for modality in MODALITY_NAMES:
-                modality_ce = checked_ratio(
-                    self.sums.require(
-                        f"{modality}_cross_entropy_sum"
-                    ),
-                    self.sums.require(f"{modality}_count"),
-                    f"{modality} masked-token cross entropy",
-                )
-                for level in range(modality_ce.numel()):
-                    values[
-                        canonical_tag(
-                            "validation",
-                            "epoch",
-                            "masked_token",
-                            "cross_entropy",
+                for metric, statistic in (
+                    ("cross_entropy", "cross_entropy_sum"),
+                    ("accuracy", "correct_sum"),
+                ):
+                    per_level = checked_ratio(
+                        self.sums.require(f"{modality}_{statistic}"),
+                        self.sums.require(f"{modality}_count"),
+                        f"{modality} masked-token {metric}",
+                    )
+                    for level in range(per_level.numel()):
+                        values[canonical_tag(
+                            "validation", "epoch", "masked_token", metric,
                             f"{level_name(level)}_{modality}",
-                        )
-                    ] = modality_ce[level]
+                        )] = per_level[level]
         return values

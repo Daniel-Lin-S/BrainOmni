@@ -1,4 +1,4 @@
-"""Render Stage-1 scalar monitoring from one provenanced training attempt.
+"""Render scalar monitors for one provenanced Stage-1 or Stage-2 attempt.
 
 Input
 -----
@@ -9,8 +9,9 @@ canonical or legacy scalar tags via ``load_monitor_events``.
 
 Output
 ------
-PNG and PDF figures in losses/, reconstruction/<stratum>/, latent_source/,
-and rvq/ under a sibling visualisation/ directory (or explicit destination).
+Selected PNG/PDF figures grouped by monitor family under a sibling
+visualisation/ directory (or explicit destination). Stage 2 uses optimization/
+and masked_token/; Stage 1 retains its existing family directories.
 manifest.json records provenance, input event files, each figure's source
 curves and transformations, generated relative filenames, and missing tags.
 Only prior manifest-listed generated figures may be removed on a rerun.
@@ -23,7 +24,9 @@ import math
 import re
 import textwrap
 import warnings
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +47,7 @@ LEGEND_FONT_SIZE = 18
 LEGEND_COLUMNS = 2
 NOTE_FONT_SIZE = 16
 LINE_WIDTH = 3
+AGGREGATE_LINE_MULTIPLIER = 2
 TICK_LENGTH = 7
 TICK_WIDTH = 1.5
 TITLE_WRAP_WIDTH = 48
@@ -58,7 +62,10 @@ MANIFEST_NAME = "manifest.json"
 MANIFEST_SCHEMA = 1
 GENERATOR = "brainomni.pretraining_visualisation"
 LEVEL_PATTERN = re.compile(r"level_\d+")
-FIGURE_FAMILIES = {"losses", "reconstruction", "latent_source", "rvq"}
+FIGURE_FAMILIES = {
+    "losses", "reconstruction", "latent_source", "rvq",
+    "optimization", "masked_token",
+}
 LOSS_COMPONENTS = (
     ("objective/optimized_loss", "Optimized total", 1.0),
     ("reconstruction/time_loss", "Time", 1.0),
@@ -88,8 +95,9 @@ class Curve:
     steps: list[int]
     values: list[float]
     transformation: str
-    colour: int
+    colour: int | str
     style: LineStyle
+    linewidth: float = LINE_WIDTH
 
 
 @dataclass(frozen=True)
@@ -154,11 +162,6 @@ def read_provenance(
             f"Requested stage {stage!r}, but {identity_path} identifies "
             f"stage {actual!r}. Use --stage {actual}."
         )
-    if actual == "brainomni":
-        raise ValueError(
-            "This visualisation command supports braintokenizer; "
-            f"campaign stage is {actual!r}."
-        )
     return identity
 
 
@@ -183,16 +186,28 @@ def campaign_dimensions(
         }
         model = json.loads(model_path.read_text())
         levels = model["num_quantizers"]
+        if identity["stage"] == "brainomni":
+            used = campaign["objective"]["num_quantizers_used"]
+            if (
+                type(used) is not int or type(levels) is not int
+                or not 0 < used <= levels
+                or type(model["num_quantizers_used"]) is not int
+                or model["num_quantizers_used"] != used
+            ):
+                raise ValueError("Inconsistent active RVQ level count.")
+            levels = used
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise ValueError(
             "Missing or malformed modality/RVQ provenance in campaign "
             f"identity or {model_path}."
         ) from error
-    if not modalities or not modalities <= {"eeg", "meg", "emeg"}:
+    if not modalities or not modalities <= {"eeg", "meg", "emeg", "both"}:
         raise ValueError(f"Invalid selected dataset modalities: {modalities}.")
     if type(levels) is not int or levels <= 0:
         raise ValueError(f"Expected positive RVQ level count, got {levels!r}.")
-    joint = "emeg" in modalities or {"eeg", "meg"} <= modalities
+    joint = bool({"emeg", "both"} & modalities) or (
+        {"eeg", "meg"} <= modalities
+    )
     return joint, [f"level_{level:02d}" for level in range(levels)]
 
 
@@ -200,7 +215,7 @@ def select_curve(
     series: dict[str, list[MonitorEvent]],
     tag: str,
     label: str,
-    colour: int,
+    colour: int | str,
     style: LineStyle,
     weight: float = 1.0,
 ) -> Curve | None:
@@ -214,8 +229,8 @@ def select_curve(
         Requested canonical tag.
     label : str
         Legend label.
-    colour : int
-        Stable categorical palette index.
+    colour : int or str
+        Stable categorical palette index or explicit Matplotlib colour.
     style : str or tuple
         Matplotlib line style.
     weight : float, optional
@@ -250,6 +265,75 @@ def select_curve(
     )
 
 
+def index_series(
+    events: list[MonitorEvent], levels: list[str],
+) -> dict[str, list[MonitorEvent]]:
+    """Group scalar events by tag and validate recorded RVQ dimensions."""
+    series: dict[str, list[MonitorEvent]] = {}
+    for event in events:
+        series.setdefault(event.tag, []).append(event)
+        level = LEVEL_PATTERN.match(event.dimension)
+        if (
+            event.family in {"rvq", "masked_token"} and level
+            and level.group() not in levels
+        ):
+            raise ValueError(
+                f"Event RVQ dimension {event.dimension!r} is absent from "
+                f"campaign levels {levels}."
+            )
+    for points in series.values():
+        points.sort(key=lambda point: point.step)
+    return series
+
+
+def append_figure(
+    figures: list[FigureSpec],
+    series: dict[str, list[MonitorEvent]],
+    name: str,
+    title: str,
+    ylabel: str,
+    requests: list[tuple[str, str, float, int | str, LineStyle]],
+    xlabel: str = "Epoch",
+    note: str = "",
+    linewidth: float = LINE_WIDTH,
+    emphasis: tuple[str, ...] = (),
+) -> None:
+    """Append a figure specification without filling missing observations.
+
+    Parameters
+    ----------
+    figures : list[FigureSpec]
+        Destination receiving the constructed specification.
+    series : dict[str, list[MonitorEvent]]
+        Events grouped by tag, with each series sorted by step.
+    name, title, ylabel : str
+        Relative output stem, title, and vertical-axis description.
+    requests : list[tuple]
+        Each tuple supplies tag, legend label, multiplier, colour and style.
+    xlabel : str, optional
+        Horizontal-axis description, default "Epoch".
+    note : str, optional
+        Figure annotation, default empty.
+    linewidth : float, optional
+        Standard curve width, default LINE_WIDTH.
+    emphasis : tuple[str, ...], optional
+        Tags drawn at twice the standard width, default empty.
+    """
+    curves, missing = [], []
+    for tag, label, weight, colour, style in requests:
+        curve = select_curve(series, tag, label, colour, style, weight)
+        if curve is None:
+            missing.append(tag)
+        else:
+            curves.append(replace(
+                curve, linewidth=(linewidth * AGGREGATE_LINE_MULTIPLIER
+                                  if tag in emphasis else linewidth),
+            ))
+    figures.append(FigureSpec(
+        name, title, ylabel, xlabel, curves, missing, note,
+    ))
+
+
 def build_figures(
     events: list[MonitorEvent],
     joint_modalities: bool,
@@ -272,42 +356,9 @@ def build_figures(
         Figure specifications, including missing curves and empty figures
         for the manifest. Rendering omits empty figures.
     """
-    series: dict[str, list[MonitorEvent]] = {}
-    for event in events:
-        series.setdefault(event.tag, []).append(event)
-        if (
-            event.family == "rvq"
-            and LEVEL_PATTERN.fullmatch(event.dimension)
-            and event.dimension not in levels
-        ):
-            raise ValueError(
-                f"Event RVQ dimension {event.dimension!r} is absent from "
-                f"campaign levels {levels}."
-            )
-    for points in series.values():
-        points.sort(key=lambda point: point.step)
+    series = index_series(events, levels)
     figures = []
-
-    def add(
-        name: str,
-        title: str,
-        ylabel: str,
-        requests: list[tuple[str, str, float, int, LineStyle]],
-        xlabel: str = "Epoch",
-        note: str = "",
-    ) -> None:
-        """Collect requested curves without filling missing observations."""
-        curves = []
-        missing = []
-        for tag, label, weight, colour, style in requests:
-            curve = select_curve(series, tag, label, colour, style, weight)
-            if curve is None:
-                missing.append(tag)
-            else:
-                curves.append(curve)
-        figures.append(FigureSpec(
-            name, title, ylabel, xlabel, curves, missing, note,
-        ))
+    add = partial(append_figure, figures, series)
 
     cadence = (
         "step" if "train/step/objective/optimized_loss" in series else "epoch"
@@ -392,7 +443,9 @@ def generated_path(root: Path, name: str) -> Path:
     return path
 
 
-def render_figure(spec: FigureSpec, root: Path) -> list[str]:
+def render_figure(
+    spec: FigureSpec, root: Path, formats: Sequence[str] = FORMATS,
+) -> list[str]:
     """Save PNG/PDF versions of a populated specification using Agg."""
     import matplotlib
 
@@ -406,8 +459,9 @@ def render_figure(spec: FigureSpec, root: Path) -> list[str]:
         for curve in spec.curves:
             axis.plot(
                 curve.steps, curve.values, label=curve.label,
-                color=palette(curve.colour % palette.N),
-                linewidth=LINE_WIDTH,
+                color=(palette(curve.colour % palette.N)
+                       if isinstance(curve.colour, int) else curve.colour),
+                linewidth=curve.linewidth,
                 linestyle=curve.style, marker="." if len(curve.steps) == 1
                 else None,
             )
@@ -468,7 +522,7 @@ def render_figure(spec: FigureSpec, root: Path) -> list[str]:
         figure.tight_layout(
             rect=(0, legend_bounds.y1 + FIGURE_MARGIN, 1, 1),
         )
-        for extension in FORMATS:
+        for extension in formats:
             name = f"{spec.name}.{extension}"
             destination = generated_path(root, name)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -483,6 +537,7 @@ def visualize_pretraining(
     tensorboard_dir: str | Path,
     stage: str | None = None,
     output_dir: str | Path | None = None,
+    formats: Sequence[str] = FORMATS,
 ) -> Path:
     """Validate, plot, and record the visualisation manifest for one attempt.
 
@@ -496,6 +551,8 @@ def visualize_pretraining(
     output_dir : str or Path or None, optional
         Absolute figure destination. By default None, selecting the sibling
         ``visualisation`` directory. Must be disjoint from the event tree.
+    formats : Sequence[str], optional
+        Nonempty selection of png/pdf, default ("png", "pdf").
 
     Returns
     -------
@@ -503,6 +560,15 @@ def visualize_pretraining(
         Absolute manifest path. Missing curves warn and are recorded;
         wholly missing figures are omitted. Validation precedes output writes.
     """
+    if (
+        isinstance(formats, str) or not formats
+        or any(value not in FORMATS for value in formats)
+        or len(set(formats)) != len(formats)
+    ):
+        raise ValueError(
+            "Formats must be a nonempty unique selection of png/pdf."
+        )
+    formats = tuple(formats)
     directory = Path(tensorboard_dir)
     if not directory.is_absolute():
         raise ValueError("TensorBoard directory must be an absolute path.")
@@ -515,7 +581,13 @@ def visualize_pretraining(
             f"Expected one event directory, found nested runs in {directory}."
         )
     events = load_monitor_events([directory])
-    figures = build_figures(events, joint, levels)
+    if identity["stage"] == "brainomni":
+        from factory.pretraining_stage_two_visualisation import (
+            build_stage_two_figures,
+        )
+        figures = build_stage_two_figures(events, joint, levels)
+    else:
+        figures = build_figures(events, joint, levels)
     root = Path(output_dir) if output_dir is not None else (
         directory.parent / "visualisation"
     )
@@ -541,11 +613,12 @@ def visualize_pretraining(
     for name in previous_files:
         generated_path(root, name)
     for spec in figures:
-        for extension in FORMATS:
+        for extension in formats:
             generated_path(root, f"{spec.name}.{extension}")
     manifest = {
         "schema_version": MANIFEST_SCHEMA,
         "generator": GENERATOR,
+        "formats": list(formats),
         "tensorboard_dir": str(directory),
         "stage": identity["stage"],
         "campaign_identity": identity,
@@ -564,6 +637,10 @@ def visualize_pretraining(
                     {
                         "label": curve.label,
                         "tag": curve.tag,
+                        "colour": curve.colour,
+                        "linestyle": curve.style,
+                        "linewidth": curve.linewidth,
+                        "marker": "." if len(curve.steps) == 1 else None,
                         "transformation": curve.transformation,
                         "point_count": len(curve.steps),
                         "first_step": curve.steps[0],
@@ -587,7 +664,9 @@ def visualize_pretraining(
                 stacklevel=2,
             )
         if spec.curves:
-            manifest["generated_files"].extend(render_figure(spec, root))
+            manifest["generated_files"].extend(
+                render_figure(spec, root, formats)
+            )
     stale = set(previous_files) - set(manifest["generated_files"])
     for name in stale:
         generated_path(root, name).unlink(missing_ok=True)

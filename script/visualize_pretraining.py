@@ -16,7 +16,9 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from factory.pretraining_visualisation import STAGES, visualize_pretraining
+from factory.pretraining_visualisation import (
+    FORMATS, STAGES, visualize_pretraining,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +33,11 @@ def parse_args() -> argparse.Namespace:
         "inferred from provenance when omitted.",
     )
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--formats", nargs="+", choices=FORMATS, default=list(FORMATS),
+        help="Output formats; defaults to png pdf. "
+        "Use --formats png for PNG only.",
+    )
     return parser.parse_args()
 
 
@@ -41,7 +48,7 @@ def main() -> None:
     if (directory / "tensorboard").is_dir():
         directory = directory / "tensorboard"
     manifest = visualize_pretraining(
-        directory, arguments.stage, arguments.output_dir,
+        directory, arguments.stage, arguments.output_dir, arguments.formats,
     )
     print(f"Saved pre-training visualisation manifest to {manifest}.")
 

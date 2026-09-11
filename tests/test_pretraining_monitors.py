@@ -599,13 +599,47 @@ class PretrainingMonitorTest(unittest.TestCase):
             values,
         )
         for modality in ("eeg", "meg"):
+            self.assertAlmostEqual(values[
+                "validation/epoch/masked_token/"
+                f"accuracy/level_00_{modality}"
+            ].item(), 0.5)
+        extra = dict(monitor)
+        extra["masked_count"] = torch.tensor(6.0)
+        extra["correct_sum"] = torch.tensor([6.0, 0.0])
+        accumulator.add_modality("eeg", extra)
+        self.assertAlmostEqual(accumulator.validation_values()[
+            "validation/epoch/masked_token/accuracy/level_00_eeg"
+        ].item(), 7 / 8)
+        remote = StageTwoAccumulator()
+        remote.update(output, monitor)
+        remote.add_modality("meg", extra)
+        remote_by_storage = {
+            value.data_ptr(): remote.sums.require(key)
+            for key, value in accumulator.sums.values.items()
+        }
+
+        def add_remote(value: torch.Tensor) -> None:
+            value.add_(remote_by_storage[value.data_ptr()])
+
+        accumulator.reduce_(add_remote)
+        combined = accumulator.validation_values()
+        for level, expected in enumerate((7 / 8, 2 / 8)):
+            self.assertAlmostEqual(combined[
+                "validation/epoch/masked_token/"
+                f"accuracy/level_{level:02d}_meg"
+            ].item(), expected)
+        self.assertFalse(any(
+            tag.endswith(("_eeg", "_meg"))
+            for tag in accumulator.training_values("epoch")
+        ))
+        for modality in ("eeg", "meg"):
             pure = StageTwoAccumulator()
             pure.update(output, monitor)
             pure.add_modality(modality, monitor)
             pure_values = pure.validation_values()
             self.assertFalse(
                 any(
-                    tag.endswith(("/eeg", "/meg"))
+                    tag.endswith(("_eeg", "_meg"))
                     for tag in pure_values
                 )
             )

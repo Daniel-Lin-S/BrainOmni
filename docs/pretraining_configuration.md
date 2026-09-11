@@ -249,6 +249,8 @@ to select the attempt directory or its `tensorboard` subdirectory;
 `--output-dir ABSOLUTE_PATH` overrides the output. Direct execution with
 `python ABSOLUTE_SCRIPT_PATH --tensorboard-dir ABSOLUTE_PATH` is also supported
 from any working directory.
+The same entry point supports BrainTokenizer (Stage 1) and BrainOmni (Stage 2).
+Use `--formats png` for PNG-only output, or `--formats png pdf` (the default).
 Stage is inferred from campaign provenance. Optional `--stage` validates
 an explicit identifier against that provenance. Figures and their manifest
 are attempt artifacts, not
@@ -259,6 +261,11 @@ dropped/visible channels and, for joint-modality runs, EEG/MEG strata. Existing
 statistics are reused without extra forward passes. Historical events may lack
 some curves; see [training monitors](pretraining_monitors.md#training-figures)
 for the figure layout and missing-metric handling.
+
+Stage 2 groups figures under `optimization/` and `masked_token/ce/` and
+`masked_token/accuracy/`. Epoch plots compare total/per-RVQ CE, training versus
+validation total CE, and per-RVQ validation metrics versus baseline gains.
+Corruption and joint EEG/MEG comparisons have individual per-RVQ figures.
 
 ## Versions
 

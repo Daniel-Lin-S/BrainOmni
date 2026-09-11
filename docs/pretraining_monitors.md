@@ -280,12 +280,18 @@ python -m script.visualize_pretraining \
   --tensorboard-dir /absolute/path/to/campaign/attempts/attempt/tensorboard
 ```
 
+The same entry point handles Stage 1 and Stage 2; direct execution of
+`script/visualize_pretraining.py` is also supported. Use `--formats png`
+for PNG-only output.
+
 By default, PNG and PDF figures are saved under the attempt's `visualisation/`
 directory beside `tensorboard/`. Use `--output-dir /absolute/path/to/figures`
 to override the destination. The command infers the stage from both stage
 fields in the campaign's `campaign_identity.json`. Optional `--stage`
 validates an explicit identifier against that provenance; missing or
 inconsistent provenance and stage mismatches are errors.
+
+Stage 1:
 
 | Directory | Figures |
 |---|---|
@@ -296,7 +302,26 @@ inconsistent provenance and stage mismatches are errors.
 | `latent_source/` | Separate validation inter-source correlation and effective-rank histories |
 | `rvq/` | Training normalized perplexity, utilization, quantization error and residual-energy reduction, each with one labelled line per level |
 
-The loss plot uses phase weight **0.5** and weight **1** for the other
+Stage 2:
+
+| Directory | Figures |
+|---|---|
+| `optimization/` | Gradient norm, learning rate by parameter group, and update-to-weight ratio against optimizer step |
+| `masked_token/ce/` | Separate training and validation total/per-RVQ CE, with thicker total curves; training versus validation totals |
+| `masked_token/ce/baseline/` | Per-RVQ validation model CE and improvement over the unigram predictor |
+| `masked_token/accuracy/baseline/` | Per-RVQ validation top-1 accuracy (%) and improvement over the majority-token predictor (percentage points), with distinct colours and line styles |
+| `masked_token/ce/corruption/` | Per-RVQ validation CE for overall, dedicated-mask and random-token corruption, when corruption monitors are available |
+| `masked_token/{ce,accuracy}/modality/` | Per-RVQ overall, EEG and MEG validation curves for campaigns using both modalities |
+
+Active Stage-2 levels come from saved `num_quantizers_used`, validated against
+model configuration. Logged total CE sums the per-level means; the optimized
+objective averages them. Each figure preserves logged coordinates and values.
+A single observation is shown as a labelled point. Modality accuracy divides
+summed correct-token counts by summed masked-token counts across batches and
+ranks, using the existing modality-only validation passes. Historical missing
+modality accuracy is annotated; it is never reconstructed from overall values.
+
+The Stage-1 loss plot uses phase weight **0.5** and weight **1** for the other
 components. The optimized total is read directly from events. The logged PCC
 loss is `exp(-aggregated PCC)`; averaging and component weighting can mean the
 plotted components do not sum exactly to the recorded total. Curves are
@@ -314,7 +339,8 @@ annotates available figures, and omits wholly unavailable figures. It does not
 substitute normalized assignment entropy for normalized perplexity.
 
 `manifest.json` records campaign provenance, event-file paths, source tags,
-transformations, figure filenames and missing curves. Reruns replace generated
+transformations, curve styles, selected formats, figure filenames and
+missing curves. Reruns replace generated
 figures and remove only stale figure files listed in the previous manifest;
 unrelated files are retained. Source events and checkpoints are unchanged.
 

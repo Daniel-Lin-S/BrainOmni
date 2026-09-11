@@ -7,6 +7,8 @@ absolute paths. No training campaigns or user artifacts are modified.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
@@ -30,6 +32,9 @@ from factory.pretraining_visualisation import (
     visualize_pretraining,
 )
 from script.visualize_pretraining import parse_args
+from factory.pretraining_stage_two_visualisation import (
+    build_stage_two_figures,
+)
 
 
 def scalar(tag: str, value: float, step: int = 1) -> MonitorEvent:
@@ -100,9 +105,10 @@ class VisualisationTests(unittest.TestCase):
             visualize_pretraining(self.directory, "braintokenizer")
         self.identity["stage"] = "brainomni"
         self.save_identity()
-        with self.assertRaisesRegex(ValueError, "supports braintokenizer"):
-            visualize_pretraining(self.directory, "brainomni")
-        with self.assertRaisesRegex(ValueError, "supports braintokenizer"):
+        self.assertEqual(
+            read_provenance(self.directory)["stage"], "brainomni",
+        )
+        with self.assertRaisesRegex(ValueError, "modality/RVQ provenance"):
             visualize_pretraining(self.directory)
         self.identity_path.unlink()
         with self.assertRaisesRegex(ValueError, "Missing or malformed"):
@@ -255,7 +261,10 @@ class VisualisationTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            visualize_pretraining(self.directory, "braintokenizer")
+            visualize_pretraining(
+                self.directory, "braintokenizer", formats=("png",),
+            )
+        self.assertFalse(list(manifest_path.parent.rglob("*.pdf")))
         self.assertFalse(stale.exists())
         self.assertEqual(unrelated.read_text(), "retain")
         manifest = json.loads(manifest_path.read_text())
@@ -277,6 +286,191 @@ class VisualisationTests(unittest.TestCase):
             visualize_pretraining(
                 self.directory, "braintokenizer", self.directory,
             )
+
+
+    def test_stage_two_active_levels(self) -> None:
+        self.identity["stage"] = "brainomni"
+        campaign = self.identity["semantic_payload"]["campaign"]
+        campaign["stage"] = "brainomni"
+        campaign["objective"] = {"num_quantizers_used": 1}
+        model_path = self.campaign / "model_cfg.json"
+        model_path.write_text(json.dumps({
+            "num_quantizers": 2, "num_quantizers_used": 1,
+        }))
+        self.assertEqual(
+            campaign_dimensions(self.directory, self.identity)[1],
+            ["level_00"],
+        )
+        campaign["objective"]["num_quantizers_used"] = 2
+        with self.assertRaisesRegex(ValueError, "modality/RVQ provenance"):
+            campaign_dimensions(self.directory, self.identity)
+
+    def test_formats_reject_invalid_selection_before_output(self) -> None:
+        for formats in ((), ("svg",), ("png", "png"), "png"):
+            with self.subTest(formats=formats):
+                with self.assertRaisesRegex(ValueError, "Formats"):
+                    visualize_pretraining(self.directory, formats=formats)
+        self.assertFalse((self.directory.parent / "visualisation").exists())
+
+    def test_direct_and_module_execution_both_stages(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        entry = repository / "script" / "visualize_pretraining.py"
+        for stage in ("braintokenizer", "brainomni"):
+            self.identity["stage"] = stage
+            campaign = self.identity["semantic_payload"]["campaign"]
+            campaign["stage"] = stage
+            campaign["objective"] = {"num_quantizers_used": 2}
+            self.save_identity()
+            (self.campaign / "model_cfg.json").write_text(json.dumps({
+                "num_quantizers": 2, "num_quantizers_used": 2,
+            }))
+            for path in self.directory.iterdir():
+                path.unlink()
+            tag = ("train/epoch/objective/optimized_loss"
+                   if stage == "braintokenizer" else
+                   "train/step/optimization/gradient_norm/global")
+            write_events(self.directory, [(tag, 0.125)])
+            for mode, arguments in (
+                ("direct", [str(entry)]),
+                ("module", ["-m", "script.visualize_pretraining"]),
+            ):
+                with self.subTest(stage=stage, mode=mode):
+                    output = self.root / stage / mode
+                    command = [sys.executable, *arguments,
+                               "--tensorboard-dir", str(self.directory),
+                               "--output-dir", str(output),
+                               "--formats", "png"]
+                    result = subprocess.run(
+                        command, cwd=repository if mode == "module"
+                        else self.root, capture_output=True, text=True,
+                        timeout=120,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    manifest = json.loads(
+                        (output / "manifest.json").read_text()
+                    )
+                    self.assertEqual(manifest["stage"], stage)
+                    self.assertEqual(manifest["formats"], ["png"])
+                    self.assertEqual(len(list(output.rglob("*.png"))), 1)
+                    self.assertFalse(list(output.rglob("*.pdf")))
+                    wrong = ("brainomni" if stage == "braintokenizer"
+                             else "braintokenizer")
+                    result = subprocess.run(
+                        command + ["--stage", wrong], cwd=repository,
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Requested stage", result.stderr)
+
+
+class StageTwoFigureTests(unittest.TestCase):
+    """Check grouping and exact coordinates without rendering synthetic data."""
+
+    def setUp(self) -> None:
+        self.levels = [f"level_{index:02d}" for index in range(4)]
+        self.events = []
+        for split in ("train", "validation"):
+            prefix = f"{split}/epoch/masked_token"
+            for level in ["total", *self.levels]:
+                self.events.append(scalar(
+                    f"{prefix}/cross_entropy/{level}", 4.0, 3,
+                ))
+        prefix = "validation/epoch/masked_token"
+        for level in self.levels:
+            for metric, value in (
+                ("accuracy", 0.6), ("accuracy_improvement", -0.2),
+                ("cross_entropy_improvement", 0.3),
+            ):
+                self.events.append(scalar(
+                    f"{prefix}/{metric}/{level}", value, 2,
+                ))
+            for suffix in ("dedicated_mask", "random_token"):
+                self.events.append(scalar(
+                    f"{prefix}/cross_entropy/{level}_{suffix}", 2.0, 5,
+                ))
+        for metric, group in (
+            ("gradient_norm", "global"), ("learning_rate", "main"),
+            ("learning_rate", "no_decay"),
+            ("update_to_weight_ratio", "global"),
+        ):
+            self.events.append(scalar(
+                f"train/step/optimization/{metric}/{group}", 0.01, 500,
+            ))
+
+    def figures(self, joint: bool = False) -> dict:
+        """Index constructed specifications by their output stem."""
+        return {figure.name: figure for figure in build_stage_two_figures(
+            self.events, joint, self.levels,
+        )}
+
+    def test_eighteen_groups_and_unmodified_logged_totals(self) -> None:
+        self.events.append(scalar("train/epoch/objective/optimized_loss", 99))
+        figures = self.figures()
+        self.assertEqual(len(figures), 18)
+        self.assertTrue(all(f.curves and not f.missing
+                            for f in figures.values()))
+        for split in ("training", "validation"):
+            curves = figures[f"masked_token/ce/{split}"].curves
+            self.assertEqual(len(curves), 5)
+            self.assertEqual(curves[0].values, [4])
+            self.assertGreater(curves[0].linewidth, curves[1].linewidth)
+        learning_rate = figures["optimization/learning_rate"]
+        self.assertEqual(len(learning_rate.curves), 2)
+        sparse = figures["optimization/update_to_weight_ratio"]
+        self.assertEqual(sparse.curves[0].steps, [500])
+        self.assertIn("one observation at optimizer step 500", sparse.note)
+        self.assertEqual(sparse.xlabel, "Optimizer step")
+
+    def test_baselines_corruptions_and_percentage_units(self) -> None:
+        figures = self.figures()
+        ce = figures["masked_token/ce/baseline/level_00"]
+        self.assertEqual([c.values for c in ce.curves], [[4], [0.3]])
+        accuracy = figures["masked_token/accuracy/baseline/level_00"]
+        self.assertEqual([c.values for c in accuracy.curves], [[60], [-20]])
+        self.assertNotEqual(accuracy.curves[0].style, accuracy.curves[1].style)
+        self.assertNotEqual(
+            accuracy.curves[0].colour, accuracy.curves[1].colour,
+        )
+        corruption = figures["masked_token/ce/corruption/level_00"]
+        self.assertEqual([c.steps for c in corruption.curves], [[3], [5], [5]])
+        self.assertEqual([c.label for c in corruption.curves],
+                         ["Overall", "Mask", "Random token"])
+
+    def test_modality_overlays_and_missing_historical_accuracy(self) -> None:
+        for level in self.levels:
+            for modality in ("eeg", "meg"):
+                self.events.append(scalar(
+                    "validation/epoch/masked_token/"
+                    f"cross_entropy/{level}_{modality}", 2, 7,
+                ))
+        figures = self.figures(True)
+        self.assertEqual(len(figures), 26)
+        ce = figures["masked_token/ce/modality/level_00"]
+        self.assertEqual(
+            [c.label for c in ce.curves], ["Overall", "EEG", "MEG"],
+        )
+        accuracy = figures["masked_token/accuracy/modality/level_00"]
+        self.assertEqual(len(accuracy.curves), 1)
+        self.assertEqual(len(accuracy.missing), 2)
+        self.events.extend(scalar(
+            f"validation/epoch/masked_token/accuracy/level_00_{modality}",
+            0.5, 7,
+        ) for modality in ("eeg", "meg"))
+        accuracy = self.figures(True)[accuracy.name]
+        self.assertEqual([c.values for c in accuracy.curves],
+                         [[60], [50], [50]])
+
+    def test_empty_nonfinite_and_inconsistent_levels(self) -> None:
+        with self.assertRaisesRegex(ValueError, "No plottable"):
+            build_stage_two_figures([], False, self.levels)
+        with self.assertRaisesRegex(ValueError, "absent from campaign"):
+            build_stage_two_figures(self.events, False, ["level_00"])
+        for value in (float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "Nonfinite.*step 8"):
+                build_stage_two_figures([scalar(
+                    "validation/epoch/masked_token/accuracy/level_00",
+                    value, 8,
+                )], False, self.levels)
 
 
 class ReconstructionEpochTests(unittest.TestCase):
