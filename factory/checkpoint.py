@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from factory.campaign import portable_weight_name
+from factory.campaign import PORTABLE_FLOAT_DTYPE, portable_weight_name
 from model_utils.conv import legacy_weight_norm_state_dict
 
 
@@ -36,7 +36,9 @@ def convert_best_checkpoint(
     Returns
     -------
     pathlib.Path
-        Generated portable state-dictionary path.
+        Generated portable state-dictionary path. Floating tensors, including
+        frozen parameters retained in training precision by DeepSpeed, use
+        FP32; non-floating tensor dtypes are preserved.
     """
     campaign_root = Path(campaign_directory).resolve()
     best_path = campaign_root / "checkpoint" / "best"
@@ -76,7 +78,11 @@ def convert_best_checkpoint(
             "Best checkpoint conversion returned no tensor state at "
             f"{best_path.resolve()}."
         )
-    portable_state = legacy_weight_norm_state_dict(state)
+    portable_state = {
+        name: tensor.to(dtype=PORTABLE_FLOAT_DTYPE)
+        if tensor.is_floating_point() else tensor
+        for name, tensor in legacy_weight_norm_state_dict(state).items()
+    }
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(
         f".{destination.name}.{os.getpid()}.convert"

@@ -34,6 +34,8 @@ CAMPAIGN_HASH_LENGTH = 20
 CAMPAIGN_IDENTITY_FILE = "campaign_identity.json"
 CAMPAIGN_STATUS_FILE = "campaign_status.json"
 CHECKPOINT_MANIFEST_FILE = "manifest.json"
+PORTABLE_FLOAT_DTYPE = torch.float32
+MODEL_STATE_PATTERN = "*model_states.pt"
 PORTABLE_WEIGHT_NAMES = {
     "braintokenizer": "BrainTokenizer.pt",
     "brainomni": "BrainOmni.pt",
@@ -532,11 +534,31 @@ def tensor_state_sha256(state: Mapping[str, torch.Tensor]) -> str:
 
 def tensor_state_schema(
     state: Mapping[str, torch.Tensor],
+    floating_dtype: torch.dtype | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Return portable tensor names, dtypes, and shapes."""
+    """Describe tensor structure without copying or changing tensor values.
+
+    Parameters
+    ----------
+    state : Mapping[str, torch.Tensor]
+        Named model parameters and buffers, each with its original shape.
+    floating_dtype : torch.dtype or None, optional
+        Expected export dtype for floating tensors. Default None preserves
+        each dtype; FP32 conversion uses torch.float32. Other dtypes remain
+        exact so integer buffers cannot silently change representation.
+
+    Returns
+    -------
+    dict[str, dict[str, Any]]
+        Tensor names mapped to dtype strings and dimension lists.
+    """
     return {
         name: {
-            "dtype": str(tensor.dtype),
+            "dtype": str(
+                floating_dtype
+                if floating_dtype is not None and tensor.is_floating_point()
+                else tensor.dtype
+            ),
             "shape": list(tensor.shape),
         }
         for name, tensor in sorted(state.items())
@@ -780,8 +802,9 @@ def ensure_campaign_health(
         if status.get("state") != "complete":
             raise CampaignHealthError(
                 f"Campaign is not complete: {campaign_root}. Observed state "
-                f"{status.get('state')!r}. Resume it with the "
-                "training command.\n"
+                f"{status.get('state')!r}. If the final epoch is saved, "
+                "run factory.campaign_health with --finish-export; otherwise "
+                "resume training.\n"
                 f"{_repair_commands(campaign_root, stage)}"
             )
         try:
@@ -884,25 +907,25 @@ def ensure_campaign_health(
         )
 
 
-def export_completed_weights(
+def _publish_completed_weights(
     context: CampaignContext,
-    expected_state: Mapping[str, torch.Tensor] | None = None,
-) -> CampaignHealth:
-    """Create and validate a stage portable checkpoint from the best tag."""
-    with campaign_lock(context.root):
-        validate_checkpoint(context.root, "best")
-        model_config = _load_json(
-            context.root / "model_cfg.json",
-            "model configuration",
-        )
-        temporary = context.portable_path.with_name(
-            f".{context.portable_path.name}.{os.getpid()}.export"
-        )
-        if temporary.exists():
-            temporary.unlink()
+    expected_state: Mapping[str, torch.Tensor] | None,
+) -> None:
+    """Publish validated FP32 weights and completion under the campaign lock."""
+    validate_checkpoint(context.root, "best")
+    model_config = _load_json(
+        context.root / "model_cfg.json",
+        "model configuration",
+    )
+    temporary = context.portable_path.with_name(
+        f".{context.portable_path.name}.{os.getpid()}.export"
+    )
+    if temporary.exists():
+        temporary.unlink()
+    try:
         _convert_best(context.root, context.stage, temporary)
         expected_schema = (
-            tensor_state_schema(expected_state)
+            tensor_state_schema(expected_state, PORTABLE_FLOAT_DTYPE)
             if expected_state is not None
             else None
         )
@@ -917,50 +940,175 @@ def export_completed_weights(
                 load_portable_state(temporary)
             )
         temporary.replace(context.portable_path)
-        status = _load_json(
-            context.root / CAMPAIGN_STATUS_FILE,
-            "campaign status",
-        )
-        status.update(
-            {
-                "state": "complete",
-                "portable_model_state_sha256": digest,
-                "portable_state_schema": expected_schema,
-                "portable_state_schema_sha256": (
-                    canonical_json_sha256(expected_schema)
-                ),
-                "completed_attempt_id": context.attempt_id,
-            }
-        )
-        failed_path_text = status.pop("active_failed_recovery", None)
-        atomic_json(context.root / CAMPAIGN_STATUS_FILE, status)
-        attempt_status = _load_json(
-            context.attempt_root / "status.json",
-            "attempt status",
-        )
-        attempt_status["state"] = "complete"
-        attempt_status["portable_model_state_sha256"] = digest
-        atomic_json(context.attempt_root / "status.json", attempt_status)
-        if failed_path_text is not None:
-            failed_path = Path(failed_path_text).resolve()
-            checkpoint_root = (context.root / "checkpoint").resolve()
-            if failed_path.parent != checkpoint_root:
-                raise CampaignHealthError(
-                    f"Refusing to remove failed recovery outside checkpoint "
-                    f"root: {failed_path}"
-                )
-            if failed_path.is_dir():
-                shutil.rmtree(failed_path)
-                warnings.warn(
-                    f"Removed recovered checkpoint quarantine: {failed_path}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    status = _load_json(
+        context.root / CAMPAIGN_STATUS_FILE,
+        "campaign status",
+    )
+    status.update(
+        {
+            "state": "complete",
+            "portable_model_state_sha256": digest,
+            "portable_state_schema": expected_schema,
+            "portable_state_schema_sha256": (
+                canonical_json_sha256(expected_schema)
+            ),
+            "completed_attempt_id": context.attempt_id,
+        }
+    )
+    failed_path_text = status.pop("active_failed_recovery", None)
+    atomic_json(context.root / CAMPAIGN_STATUS_FILE, status)
+    attempt_status = _load_json(
+        context.attempt_root / "status.json",
+        "attempt status",
+    )
+    attempt_status["state"] = "complete"
+    attempt_status["portable_model_state_sha256"] = digest
+    atomic_json(context.attempt_root / "status.json", attempt_status)
+    if failed_path_text is not None:
+        failed_path = Path(failed_path_text).resolve()
+        checkpoint_root = (context.root / "checkpoint").resolve()
+        if failed_path.parent != checkpoint_root:
+            raise CampaignHealthError(
+                f"Refusing to remove failed recovery outside checkpoint "
+                f"root: {failed_path}"
+            )
+        if failed_path.is_dir():
+            shutil.rmtree(failed_path)
+            warnings.warn(
+                f"Removed recovered checkpoint quarantine: {failed_path}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+
+def export_completed_weights(
+    context: CampaignContext,
+    expected_state: Mapping[str, torch.Tensor] | None = None,
+) -> CampaignHealth:
+    """Export the best checkpoint, checking FP32 structure and finite values.
+
+    Parameters
+    ----------
+    context : CampaignContext
+        Campaign and attempt receiving the completed portable artifact.
+    expected_state : Mapping[str, torch.Tensor] or None, optional
+        Model tensors supplying names and shapes. Default None constructs
+        the model from saved configuration. Floating tensors are validated
+        as FP32 regardless of the live training precision.
+
+    Returns
+    -------
+    CampaignHealth
+        Verified portable weight identity and path.
+    """
+    with campaign_lock(context.root):
+        _publish_completed_weights(context, expected_state)
     return ensure_campaign_health(
         context.root,
         expected_stage=context.stage,
         repair=False,
     )
+
+
+def _validate_finished_training(root: Path, total_epochs: int) -> str:
+    """Verify all latest model shards reached the configured final epoch."""
+    digest = validate_checkpoint(root, "latest")
+    paths = sorted((root / "checkpoint" / "latest").glob(MODEL_STATE_PATTERN))
+    if not paths:
+        raise CampaignHealthError(
+            f"No model-state shards exist in {root / 'checkpoint' / 'latest'}."
+        )
+    for path in paths:
+        try:
+            # Verified training shards also contain NumPy RNG state.
+            state = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as error:
+            raise CampaignHealthError(
+                f"Could not read verified checkpoint {path}: {error}"
+            ) from error
+        epoch = state.get("epoch") if isinstance(state, dict) else None
+        if type(epoch) is not int or epoch != total_epochs:
+            raise CampaignHealthError(
+                f"Expected completed epoch {total_epochs}, got {epoch!r} "
+                f"in {path}. Resume training before finishing export."
+            )
+    return digest
+
+
+def finish_campaign_export(root: str | Path) -> CampaignHealth:
+    """Recover an interrupted export using saved checkpoints on the CPU.
+
+    Parameters
+    ----------
+    root : str or Path
+        Campaign with verified semantic sidecars and best/latest checkpoint
+        manifests. Latest model shards must record the final training epoch.
+
+    Returns
+    -------
+    CampaignHealth
+        Verified portable weights. A new export-only attempt records source
+        checkpoint digests; previous attempt outcomes and logs are preserved.
+        No training, evaluation, or random-state restoration is performed.
+    """
+    campaign_root = Path(root).resolve()
+    if not campaign_root.is_dir():
+        raise CampaignHealthError(
+            f"Campaign root is not a directory: {campaign_root}."
+        )
+    with campaign_lock(campaign_root):
+        identity, _, status = _validate_sidecars(campaign_root, None)
+        if status.get("state") != "complete":
+            if status.get("state") != "incomplete":
+                raise CampaignHealthError(
+                    f"Expected incomplete or complete campaign at "
+                    f"{campaign_root}, got {status.get('state')!r}."
+                )
+            epochs = identity["semantic_payload"]["campaign"].get(
+                "training", {}
+            ).get("epochs")
+            if type(epochs) is not int or epochs <= 0:
+                raise CampaignHealthError(
+                    f"Invalid configured training epoch count {epochs!r} "
+                    f"at {campaign_root}."
+                )
+            latest_digest = _validate_finished_training(campaign_root, epochs)
+            best_digest = validate_checkpoint(campaign_root, "best")
+            attempt_id = f"export-{_attempt_id()}"
+            attempt_root = campaign_root / "attempts" / attempt_id
+            attempt_root.mkdir()
+            context = CampaignContext(
+                root=campaign_root,
+                attempt_root=attempt_root,
+                attempt_id=attempt_id,
+                stage=identity["stage"],
+                identity_sha256=identity["campaign_sha256"],
+                training_required=False,
+            )
+            attempt_status = {
+                "attempt_id": attempt_id,
+                "campaign_sha256": context.identity_sha256,
+                "state": "exporting",
+                "action": "export_only",
+                "training_required": False,
+                "evaluation_performed": False,
+                "completed_epochs": epochs,
+                "source_checkpoint_sha256": {
+                    "latest": latest_digest,
+                    "best": best_digest,
+                },
+            }
+            atomic_json(attempt_root / "status.json", attempt_status)
+            try:
+                _publish_completed_weights(context, None)
+            except Exception as error:
+                attempt_status.update(state="failed", error=str(error))
+                atomic_json(attempt_root / "status.json", attempt_status)
+                raise
+    return ensure_campaign_health(campaign_root, repair=True)
 
 
 def quarantine_failed_recovery(

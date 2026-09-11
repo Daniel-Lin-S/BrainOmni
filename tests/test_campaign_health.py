@@ -24,11 +24,13 @@ from factory.campaign import (
     ensure_campaign_health,
     ensure_training_campaign,
     export_completed_weights,
+    finish_campaign_export,
     prepare_campaign,
     record_checkpoint,
     tensor_state_sha256,
     validate_portable_state,
 )
+from factory.checkpoint import convert_best_checkpoint
 from factory.training_runtime import (
     evaluation_metrics_path,
     write_evaluation_metrics,
@@ -54,7 +56,7 @@ class CampaignHealthTest(unittest.TestCase):
         payload = {
             "campaign": {
                 "data": {"preprocessing": {"sample_rate_hz": 256}},
-                "epochs": 2,
+                "training": {"epochs": 2},
                 "stage": stage,
             }
         }
@@ -101,6 +103,194 @@ class CampaignHealthTest(unittest.TestCase):
         (best / "model_states.pt").write_bytes(b"checkpoint")
         record_checkpoint(campaign_root, "best")
         return campaign_root
+
+    def _pending_export(
+        self,
+        root: Path,
+        stage: str,
+        state: dict[str, torch.Tensor],
+        epoch: int = 2,
+    ) -> CampaignContext:
+        """Create an export failure with verified final-epoch metadata."""
+        campaign = self._campaign(root, stage, state)
+        status_path = campaign / "campaign_status.json"
+        status = json.loads(status_path.read_text())
+        status.pop("portable_model_state_sha256")
+        status["state"] = "incomplete"
+        atomic_json(status_path, status)
+        attempt_root = campaign / "attempts" / "training-attempt"
+        attempt_root.mkdir(parents=True)
+        atomic_json(
+            attempt_root / "status.json",
+            {"state": "failed", "error": "export failed"},
+        )
+        context = CampaignContext(
+            root=campaign,
+            attempt_root=attempt_root,
+            attempt_id=attempt_root.name,
+            stage=stage,
+            identity_sha256=status["campaign_sha256"],
+            training_required=True,
+        )
+        context.portable_path.unlink()
+        latest = context.checkpoint_root / "latest"
+        latest.mkdir()
+        torch.save({"epoch": epoch}, latest / "mp_rank_00_model_states.pt")
+        record_checkpoint(campaign, "latest")
+        return context
+
+    def test_converter_promotes_frozen_parameters_to_fp32(self) -> None:
+        """DeepSpeed may retain frozen parameter fragments in BF16."""
+        state = {
+            "weight": torch.ones(2, 3),
+            "frozen.weight": torch.ones(2, 3, dtype=torch.bfloat16),
+            "counter": torch.tensor(2),
+        }
+        converter = ModuleType("deepspeed.utils.zero_to_fp32")
+        converter.get_fp32_state_dict_from_zero_checkpoint = mock.Mock(
+            return_value=state,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            context = self._pending_export(
+                Path(temporary), "brainomni", state,
+            )
+            with mock.patch.dict(
+                sys.modules, {"deepspeed.utils.zero_to_fp32": converter},
+            ):
+                destination = convert_best_checkpoint(
+                    context.root, stage=context.stage,
+                )
+            saved = torch.load(destination, weights_only=True)
+            self.assertEqual(saved["frozen.weight"].dtype, torch.float32)
+            self.assertEqual(saved["counter"].dtype, torch.int64)
+            self.assertEqual(state["frozen.weight"].dtype, torch.bfloat16)
+            torch.testing.assert_close(
+                saved["frozen.weight"], state["frozen.weight"].float(),
+            )
+
+    def test_export_validates_fp32_from_mixed_precision_training(self) -> None:
+        """Keep FP32 weights while validating low-precision live models."""
+        portable = {"weight": torch.ones(2, 3), "count": torch.tensor(2)}
+        for stage in ("braintokenizer", "brainomni"):
+            for dtype in (torch.bfloat16, torch.float16):
+                with self.subTest(stage=stage, dtype=dtype):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        context = self._pending_export(
+                            Path(temporary), stage, portable,
+                        )
+                        expected = {
+                            "weight": portable["weight"].to(dtype),
+                            "count": portable["count"],
+                        }
+                        with mock.patch(
+                            "factory.campaign._convert_best",
+                            side_effect=lambda root, stage, destination:
+                                torch.save(portable, destination),
+                        ):
+                            health = export_completed_weights(context, expected)
+                        self.assertEqual(
+                            health.model_state_sha256,
+                            tensor_state_sha256(portable),
+                        )
+                        status = json.loads(
+                            (context.root / "campaign_status.json").read_text()
+                        )
+                        self.assertEqual(
+                            status["portable_state_schema"]["weight"]["dtype"],
+                            "torch.float32",
+                        )
+                        self.assertEqual(expected["weight"].dtype, dtype)
+
+    def test_failed_export_cleans_temporary_and_preserves_status(self) -> None:
+        """Invalid conversions cannot publish or complete a campaign."""
+        expected = {"weight": torch.ones(2, 3, dtype=torch.bfloat16)}
+        bad_states = (
+            {"weight": torch.ones(2, 3, dtype=torch.bfloat16)},
+            {"weight": torch.ones(3, 2)},
+            {"other": torch.ones(2, 3)},
+            {"weight": torch.full((2, 3), float("nan"))},
+        )
+        for state in bad_states:
+            with self.subTest(state=state):
+                with tempfile.TemporaryDirectory() as temporary:
+                    context = self._pending_export(
+                        Path(temporary), "braintokenizer", expected,
+                    )
+                    status_path = context.root / "campaign_status.json"
+                    before = status_path.read_bytes()
+                    with mock.patch(
+                        "factory.campaign._convert_best",
+                        side_effect=lambda root, stage, destination:
+                            torch.save(state, destination),
+                    ):
+                        with self.assertRaises(CampaignHealthError):
+                            export_completed_weights(context, expected)
+                    self.assertEqual(status_path.read_bytes(), before)
+                    self.assertFalse(context.portable_path.exists())
+                    self.assertFalse(list(context.root.glob("*.export")))
+
+    def test_finish_export_preserves_training_history_and_is_idempotent(
+        self,
+    ) -> None:
+        """Recover final-epoch weights without relabeling the failed attempt."""
+        state = {"weight": torch.ones(2, 3)}
+        with tempfile.TemporaryDirectory() as temporary:
+            context = self._pending_export(
+                Path(temporary), "braintokenizer", state,
+            )
+            previous = (context.attempt_root / "status.json").read_bytes()
+            manifest = context.checkpoint_root / "manifest.json"
+            checkpoint_before = manifest.read_bytes()
+            with mock.patch(
+                "factory.campaign._expected_model_state", return_value=state,
+            ), mock.patch(
+                "factory.campaign._convert_best",
+                side_effect=lambda root, stage, destination:
+                    torch.save(state, destination),
+            ) as converter:
+                health = finish_campaign_export(context.root)
+                repeated = finish_campaign_export(context.root)
+            converter.assert_called_once()
+            self.assertEqual(health, repeated)
+            self.assertEqual(manifest.read_bytes(), checkpoint_before)
+            self.assertEqual(
+                (context.attempt_root / "status.json").read_bytes(), previous,
+            )
+            attempts = list(
+                (context.root / "attempts").glob("export-*/status.json")
+            )
+            self.assertEqual(len(attempts), 1)
+            recovery = json.loads(attempts[0].read_text())
+            self.assertEqual(recovery["state"], "complete")
+            self.assertEqual(recovery["action"], "export_only")
+            self.assertFalse(recovery["evaluation_performed"])
+
+    def test_finish_export_rejects_unfinished_or_corrupt_latest(self) -> None:
+        """Final-epoch proof and checkpoint integrity precede conversion."""
+        state = {"weight": torch.ones(2, 3)}
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt):
+                with tempfile.TemporaryDirectory() as temporary:
+                    context = self._pending_export(
+                        Path(temporary), "braintokenizer", state,
+                        epoch=2 if corrupt else 1,
+                    )
+                    if corrupt:
+                        path = (
+                            context.checkpoint_root / "latest"
+                            / "mp_rank_00_model_states.pt"
+                        )
+                        path.write_bytes(b"corrupt")
+                    with mock.patch(
+                        "factory.campaign._convert_best",
+                    ) as converter:
+                        with self.assertRaises(CampaignHealthError):
+                            finish_campaign_export(context.root)
+                    converter.assert_not_called()
+                    self.assertFalse(context.portable_path.exists())
+                    self.assertEqual(
+                        len(list((context.root / "attempts").iterdir())), 1,
+                    )
 
     def test_health_and_repair_cover_both_stages(self) -> None:
         state = {"weight": torch.arange(6, dtype=torch.float32).reshape(2, 3)}
