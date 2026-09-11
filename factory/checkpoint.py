@@ -1,4 +1,10 @@
-"""Convert completed DeepSpeed checkpoints into portable model weights."""
+"""Convert checkpoint/best shards into an atomic portable state dictionary.
+
+Input is a campaign directory with DeepSpeed model/optimizer shards. Output
+is BrainTokenizer.pt or BrainOmni.pt, containing named parameters and buffers.
+Real floating tensors use FP32; complex, integer and boolean buffers retain
+their original values and dtypes from the saved model-state shard.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,44 @@ import torch
 
 from factory.campaign import PORTABLE_FLOAT_DTYPE, portable_weight_name
 from model_utils.conv import legacy_weight_norm_state_dict
+
+
+def _original_buffers(model_path: Path) -> dict[str, torch.Tensor]:
+    """Read saved buffers before DeepSpeed's unconditional FP32 conversion.
+
+    Parameters
+    ----------
+    model_path : Path
+        First model shard in DeepSpeed's checkpoint ordering. DeepSpeed also
+        selects this shard's replicated buffers when consolidating weights.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        Named buffers with original shapes, dtypes and values. The trusted
+        training shard includes non-tensor metadata and needs full loading.
+        Missing, non-tensor or nonfinite buffers raise ValueError.
+    """
+    state = torch.load(model_path, map_location="cpu", weights_only=False)
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("buffer_names"), (list, tuple))
+        or not isinstance(state.get("module"), dict)
+    ):
+        raise ValueError(f"Malformed buffer metadata in {model_path}.")
+    buffers = {}
+    for name in state["buffer_names"]:
+        value = state["module"].get(name)
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(
+                f"Expected saved tensor buffer {name!r} in {model_path}."
+            )
+        if not torch.isfinite(value).all().item():
+            raise ValueError(
+                f"Nonfinite saved buffer {name!r} in {model_path}."
+            )
+        buffers[name] = value
+    return buffers
 
 
 def convert_best_checkpoint(
@@ -61,12 +105,15 @@ def convert_best_checkpoint(
     try:
         from deepspeed.utils.zero_to_fp32 import (
             get_fp32_state_dict_from_zero_checkpoint,
+            get_model_state_files,
         )
     except ImportError as error:
         raise RuntimeError(
             "DeepSpeed checkpoint conversion is unavailable. Install the "
             "training environment, then rerun campaign repair."
         ) from error
+    model_path = Path(get_model_state_files(str(best_path))[0])
+    buffers = _original_buffers(model_path)
     state = get_fp32_state_dict_from_zero_checkpoint(
         str(campaign_root / "checkpoint"),
         tag="best",
@@ -78,6 +125,9 @@ def convert_best_checkpoint(
             "Best checkpoint conversion returned no tensor state at "
             f"{best_path.resolve()}."
         )
+    # DeepSpeed casts even complex/integer buffers to float; restore
+    # saved values before applying our real-floating-only FP32 policy.
+    state.update(buffers)
     portable_state = {
         name: tensor.to(dtype=PORTABLE_FLOAT_DTYPE)
         if tensor.is_floating_point() else tensor

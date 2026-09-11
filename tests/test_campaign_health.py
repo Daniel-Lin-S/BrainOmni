@@ -30,7 +30,7 @@ from factory.campaign import (
     tensor_state_sha256,
     validate_portable_state,
 )
-from factory.checkpoint import convert_best_checkpoint
+from factory.checkpoint import _original_buffers, convert_best_checkpoint
 from factory.training_runtime import (
     evaluation_metrics_path,
     write_evaluation_metrics,
@@ -144,15 +144,30 @@ class CampaignHealthTest(unittest.TestCase):
         state = {
             "weight": torch.ones(2, 3),
             "frozen.weight": torch.ones(2, 3, dtype=torch.bfloat16),
-            "counter": torch.tensor(2),
+            "counter": torch.tensor(2 ** 40 + 1),
+            "enabled": torch.tensor(True),
+            "rotate": torch.tensor([1 + 2j, -3 + 4j]),
+            "running": torch.tensor([0.125], dtype=torch.bfloat16),
         }
+        buffers = {key: value for key, value in state.items()
+                   if not key.endswith("weight")}
+        converted = dict(state)
+        converted.update({
+            key: value.real.float() for key, value in buffers.items()
+        })
         converter = ModuleType("deepspeed.utils.zero_to_fp32")
         converter.get_fp32_state_dict_from_zero_checkpoint = mock.Mock(
-            return_value=state,
+            return_value=converted,
         )
         with tempfile.TemporaryDirectory() as temporary:
             context = self._pending_export(
                 Path(temporary), "brainomni", state,
+            )
+            model_path = context.checkpoint_root / "best" / "model_states.pt"
+            torch.save({"buffer_names": list(buffers), "module": buffers},
+                       model_path)
+            converter.get_model_state_files = mock.Mock(
+                return_value=[str(model_path)],
             )
             with mock.patch.dict(
                 sys.modules, {"deepspeed.utils.zero_to_fp32": converter},
@@ -162,11 +177,29 @@ class CampaignHealthTest(unittest.TestCase):
                 )
             saved = torch.load(destination, weights_only=True)
             self.assertEqual(saved["frozen.weight"].dtype, torch.float32)
+            for key, value in buffers.items():
+                expected = value.float() if value.is_floating_point() else value
+                torch.testing.assert_close(saved[key], expected)
             self.assertEqual(saved["counter"].dtype, torch.int64)
             self.assertEqual(state["frozen.weight"].dtype, torch.bfloat16)
             torch.testing.assert_close(
                 saved["frozen.weight"], state["frozen.weight"].float(),
             )
+
+    def test_invalid_saved_buffers_are_rejected(self) -> None:
+        """Never publish invented or nonfinite replacement buffer values."""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "model_states.pt"
+            for state in (
+                {},
+                {"buffer_names": ["rotate"], "module": {}},
+                {"buffer_names": ["rotate"],
+                 "module": {"rotate": torch.tensor(complex(1, float("nan")))}}
+            ):
+                with self.subTest(state=state):
+                    torch.save(state, path)
+                    with self.assertRaisesRegex(ValueError, str(path)):
+                        _original_buffers(path)
 
     def test_export_validates_fp32_from_mixed_precision_training(self) -> None:
         """Keep FP32 weights while validating low-precision live models."""
