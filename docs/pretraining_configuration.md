@@ -2,7 +2,7 @@
 
 This is the public, authoritative schema reference for BrainTokenizer and BrainOmni. Update it with every schema, validation, default, or artifact change.
 
-## 1. Configuration precedence and launch flow
+## 1. Configuration precedence
 
 All `--config` files merge left-to-right; repeatable `--set` overrides apply
 last. Validation runs only after the final complete merge. Run the commands
@@ -27,62 +27,6 @@ datasets:
     path: <local path>
     signal_type: meg
     exclude_channel_types: [eeg]
-```
-
-### Preprocessing
-
-Prepare the recordings before training, using the same configuration layers:
-
-```bash
-bash script/pretrain_preprocess.sh \
-  --config configs/pretrain/braintokenizer.yaml LOCAL_FILE
-```
-
-Preprocessing scans the union of `campaign.data.included_datasets` and
-`invocation.held_out_evaluation_datasets`. Held-out datasets receive the same
-preprocessing and separate whole-dataset JSON metadata; they never enter the
-training, validation, or test splits or change the training split identity.
-Unrequested catalog entries are not scanned. Missing requested held-out
-windows cause a clear error. Completion metadata records the actual channel
-exclusions. Cache reuse rejects changed or unrecorded exclusions; use fresh
-`processed_root` and `metadata_root` directories for changed settings.
-
-Raw discovery uses subject folders at BIDS roots and excludes nested
-`derivatives/` and hidden repository directories. MNE reads split FIF
-recordings through their first part. Every retained recording must match
-its catalog modality after applying the configured channel exclusions.
-
-The terminal log reports dataset discovery/header validation, recording
-processing progress, and datasets skipped because their recordings are already
-complete. Detailed statistics are saved in `dataset_summary.json` beside
-`terminal.log`, with separate `included_datasets` and `evaluation_datasets`
-aggregates and per-dataset summaries. Unselected cached datasets are excluded.
-An empty evaluation selection is marked `not_requested`.
-
-For Stage 2, pass the selected BrainOmni configuration and its local overlay
-to the same preprocessing command.
-
-### Training
-
-Train Stage 1 with the prepared BrainTokenizer configuration:
-
-```bash
-bash script/train_braintokenizer.sh --num-gpus N --config configs/pretrain/braintokenizer.yaml LOCAL_FILE
-```
-
-There is no generic Stage-2 default: select `brainomni_tiny.yaml` or
-`brainomni_base.yaml` explicitly.
-
-Stage 2 uses an explicit paper-aligned architecture choice: tiny is 256 hidden
-dimensions, 8 heads, 12 layers, and `5e-4`; base is 512 dimensions, 16 heads,
-12 layers, and `4e-4`.
-
-```bash
-bash script/train_brainomni.sh --num-gpus N --config configs/pretrain/brainomni_tiny.yaml LOCAL_FILE
-```
-
-```bash
-bash script/train_brainomni.sh --num-gpus N --config configs/pretrain/brainomni_base.yaml LOCAL_FILE
 ```
 
 ## 2. Campaign-wide settings
