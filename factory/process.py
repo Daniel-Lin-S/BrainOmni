@@ -76,8 +76,36 @@ def describe_recording_channels(
 def discover_catalog_recordings(
     accessor: DataAccessor,
     config: dict,
+    completion_records: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
-    """Discover and validate recordings from every selected catalog root."""
+    """Discover selected recordings, validating only uncached headers.
+
+    Parameters
+    ----------
+    accessor : DataAccessor
+        Recording discovery and raw-header reader.
+    config : dict
+        Resolved launch settings selecting catalog roots and exclusions.
+    completion_records : list[dict[str, object]] or None, optional
+        Versioned records from this preprocessing settings cache, default
+        None. Channel selection must match before any cached file is reused.
+        Legacy path-only markers require header validation for migration.
+
+    Returns
+    -------
+    list[dict[str, object]]
+        Discovered paths and dataset IDs; only uncached entries have freshly
+        validated header fields. Completed entries are filtered before work
+        submission. File discovery still detects newly added recordings.
+    """
+    cached_records = (
+        completion_records if completion_records is not None else []
+    )
+    validate_cached_channel_selection(cached_records, config)
+    cached = {
+        (record["dataset"], str(Path(record["recording_path"]).resolve()))
+        for record in cached_records
+    }
     catalog = selected_data_catalog(config, include_held_out=True)
     recordings: list[dict[str, object]] = []
     logger = logging.getLogger("processor")
@@ -92,6 +120,23 @@ def discover_catalog_recordings(
             raise ConfigError(
                 f"No supported recordings exist below data catalog root: {root}"
             )
+        cached_files = [
+            row for row in dataset_files
+            if (dataset, str(Path(row["path"]).resolve())) in cached
+        ]
+        recordings.extend(cached_files)
+        dataset_files = [
+            row for row in dataset_files
+            if (dataset, str(Path(row["path"]).resolve())) not in cached
+        ]
+        if cached_files:
+            logger.info(
+                "dataset=%s: skipped header validation for %d already "
+                "complete recordings; %d new recordings to validate",
+                dataset, len(cached_files), len(dataset_files),
+            )
+        if not dataset_files:
+            continue
         logger.info(
             "dataset=%s: validating %d recording headers",
             dataset, len(dataset_files),
@@ -655,7 +700,8 @@ def select_pending_recordings(
     Parameters
     ----------
     recordings : list[dict[str, object]]
-        Validated recording headers containing dataset IDs and absolute paths.
+        Discovered recordings with dataset IDs and absolute paths; pending
+        entries also contain validated header fields.
     completed_paths : set[str]
         Canonical paths already processed under verified settings.
     logger : logging.Logger
@@ -757,8 +803,6 @@ if __name__ == "__main__":
         "dataset_snapshots.json",
     )
 
-    logger.info("searching_brain_files...")
-    brain_files = discover_catalog_recordings(accessor, config)
     logger.info("loading archives...")
     finish_data: object = []
     if os.path.exists(finish_path):
@@ -777,6 +821,10 @@ if __name__ == "__main__":
             metadata_list = json.load(f)
     else:
         metadata_list = []
+    logger.info("searching_brain_files...")
+    brain_files = discover_catalog_recordings(
+        accessor, config, completion_records,
+    )
     if legacy_finish_paths:
         logger.info(
             "migrating %d legacy completed recording(s) from metadata...",

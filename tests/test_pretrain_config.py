@@ -42,10 +42,17 @@ from pretrain_config import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def mocked_zero_modules(consolidate: object) -> dict[str, ModuleType]:
-    """Return temporary DeepSpeed modules exposing one consolidator."""
+def mocked_zero_modules(
+    consolidate: object, run_path: Path,
+) -> dict[str, ModuleType]:
+    """Provide a consolidator and a saved model shard with no buffers."""
+    model_path = run_path / "checkpoint" / "best" / "model_states.pt"
+    torch.save({"buffer_names": [], "module": {}}, model_path)
     zero_module = ModuleType("deepspeed.utils.zero_to_fp32")
     zero_module.get_fp32_state_dict_from_zero_checkpoint = consolidate
+    zero_module.get_model_state_files = mock.Mock(
+        return_value=[str(model_path)],
+    )
     utils_module = ModuleType("deepspeed.utils")
     deepspeed_module = ModuleType("deepspeed")
     utils_module.zero_to_fp32 = zero_module
@@ -800,7 +807,7 @@ class PretrainConfigTest(unittest.TestCase):
 
             with mock.patch.dict(
                 sys.modules,
-                mocked_zero_modules(consolidate),
+                mocked_zero_modules(consolidate, run_path),
             ):
                 output_path = convert_best_checkpoint(run_path)
             self.assertEqual(output_path, run_path / "BrainTokenizer.pt")
@@ -825,7 +832,7 @@ class PretrainConfigTest(unittest.TestCase):
 
             with mock.patch.dict(
                 sys.modules,
-                mocked_zero_modules(consolidate),
+                mocked_zero_modules(consolidate, run_path),
             ), mock.patch(
                 "factory.checkpoint.torch.save",
                 side_effect=OSError("disk write failed"),
