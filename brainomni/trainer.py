@@ -195,7 +195,7 @@ class Trainer:
             )
 
     def _export_completed_checkpoint(self):
-        dist.barrier()
+        torch.distributed.barrier(device_ids=[self.local_rank])
         failed = torch.zeros(
             (1,),
             device=self.local_rank,
@@ -223,7 +223,7 @@ class Trainer:
             raise RuntimeError(
                 "Rank zero could not export and validate BrainOmni.pt."
             )
-        dist.barrier()
+        torch.distributed.barrier(device_ids=[self.local_rank])
 
     def _evaluate_requested_datasets(self):
         self.logger.info("=> Start Testing ...")
@@ -235,7 +235,7 @@ class Trainer:
                 mode,
                 self.rank,
             ):
-                dist.barrier()
+                torch.distributed.barrier(device_ids=[self.local_rank])
                 continue
             metadata_path = evaluation_metadata_path(
                 self.cfg.pretrain_metadata_path,
@@ -248,7 +248,7 @@ class Trainer:
                 metadata_path,
             ):
                 self.logger.info("Verified existing evaluation for %s.", mode)
-                dist.barrier()
+                torch.distributed.barrier(device_ids=[self.local_rank])
                 continue
             self.test_loader = self.build_dataloader(mode=mode, ratio=1.0)
             if len(self.test_loader) == 0:
@@ -277,7 +277,7 @@ class Trainer:
                     metadata_path,
                 )
                 self.logger.info("Saved evaluation metrics to %s.", path)
-            dist.barrier()
+            torch.distributed.barrier(device_ids=[self.local_rank])
 
     def count_epoch(self):
         self.epoch += 1

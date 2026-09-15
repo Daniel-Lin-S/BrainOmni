@@ -66,14 +66,14 @@ def save_distributed_checkpoint(
     state["runtime_recovery_identity"] = _engine_recovery_identity(engine)
     lock = campaign_lock(context.root) if rank == 0 else nullcontext()
     with lock:
-        dist.barrier()
+        dist.barrier(device_ids=[engine.local_rank])
         engine.save_checkpoint(
             save_dir=str(context.checkpoint_root),
             tag=tag,
             client_state=state,
             save_latest=False,
         )
-        dist.barrier()
+        dist.barrier(device_ids=[engine.local_rank])
         if rank == 0:
             record_checkpoint(
                 context.root,
@@ -81,7 +81,7 @@ def save_distributed_checkpoint(
                 runtime_identity=_engine_recovery_identity(engine),
                 acquire_lock=False,
             )
-        dist.barrier()
+        dist.barrier(device_ids=[engine.local_rank])
 
 
 def resume_distributed_checkpoint(
@@ -95,7 +95,7 @@ def resume_distributed_checkpoint(
     rank = dist.get_rank()
     lock = campaign_lock(context.root) if rank == 0 else nullcontext()
     with lock:
-        dist.barrier()
+        dist.barrier(device_ids=[engine.local_rank])
         validate_checkpoint(
             context.root,
             "latest",
@@ -105,7 +105,7 @@ def resume_distributed_checkpoint(
             load_dir=str(context.checkpoint_root),
             tag="latest",
         )
-        dist.barrier()
+        dist.barrier(device_ids=[engine.local_rank])
     if load_path is None or client_state is None:
         raise CampaignHealthError(
             f"DeepSpeed could not restore latest checkpoint at "
