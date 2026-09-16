@@ -30,6 +30,7 @@ import yaml
 from pretrain_config import ConfigError, selected_data_catalog, sha256_file
 from factory.channel_selection import channel_selection_provenance
 
+ATTENTION_DROPOUT_POLICY = "train_only"
 ARTIFACT_SCHEMA_VERSION = 1
 CAMPAIGN_HASH_LENGTH = 20
 CAMPAIGN_IDENTITY_FILE = "campaign_identity.json"
@@ -226,6 +227,7 @@ def _semantic_payload(
     }
     payload: dict[str, Any] = {
         "configuration_schema_version": config["schema_version"],
+        "attention_dropout_policy": ATTENTION_DROPOUT_POLICY,
         "campaign": campaign,
         "model_config_sha256": canonical_json_sha256(model_config),
         "split_manifest_sha256": split_manifest["sha256"],

@@ -221,3 +221,8 @@ Stage 1 now initializes EMA vector sums using k-means occupancy counts and
 revives dead codes after updating EMA state, resetting counts and sums together.
 Training and evaluation use the same circular phase distance in radians;
 Hamming windowing, equal frequency-bin weighting and loss weights are unchanged.
+
+Attention dropout is active only during training and disabled for evaluation
+and tokenizer inference. Campaign identity records
+`attention_dropout_policy: train_only`, keeping these semantics separate
+from historical campaigns. Existing checkpoints remain loadable.

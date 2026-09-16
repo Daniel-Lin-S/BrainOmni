@@ -50,7 +50,9 @@ class ForwardSolution(nn.Module):
         v = rearrange(v, "B T (H D) -> B H T D", H=self.n_head)
         output = (
             F.scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.dropout, is_causal=False
+                query=q, key=k, value=v,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False
             )
             .transpose(1, 2)
             .contiguous()
@@ -87,7 +89,9 @@ class BackWardSolution(nn.Module):
                 (q.float() @ k.float().transpose(-2, -1)) * scale,
                 dim=-1,
             )
-        attention_dropout = 0.0 if return_attention else self.dropout
+        attention_dropout = (
+            self.dropout if self.training and not return_attention else 0.0
+        )
         output = (
             F.scaled_dot_product_attention(
                 query=q,

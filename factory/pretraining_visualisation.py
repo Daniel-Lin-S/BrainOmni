@@ -37,7 +37,7 @@ from factory.pretraining_monitor_events import (
 )
 
 STAGES = ("braintokenizer", "brainomni")
-FORMATS = ("png")
+FORMATS = ("png",)
 FIGURE_SIZE = (10, 7)
 FIGURE_DPI = 180
 TITLE_FONT_SIZE = 24
